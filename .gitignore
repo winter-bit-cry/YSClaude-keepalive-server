@@ -1,3 +1,10 @@
 data/
 *.log
 node_modules/
+.env
+.env.*
+!.env.example
+secrets/
+*-firebase-adminsdk-*.json
+firebase-service-account*.json
+service-account*.json
