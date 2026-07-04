@@ -766,14 +766,18 @@ function buildAgentTickToolLines(item, tools) {
 }
 
 function buildAgentTickPrompt(item, plannedAt, tools) {
-  const elapsedMinutes = Math.max(1, Math.round((plannedAt - (item.lastTouchedAt || item.updatedAt || plannedAt)) / 60000));
+  const lastUserSnapshotAt = item.lastUserSnapshotAt || item.lastSnapshotAt || item.updatedAt || item.lastTouchedAt || plannedAt;
+  const elapsedUserMinutes = Math.max(0, Math.round((plannedAt - lastUserSnapshotAt) / 60000));
   const currentTime = now();
   return [
     `Current server time: ${new Date(currentTime).toISOString()}`,
     `This wake was planned for: ${new Date(plannedAt).toISOString()}`,
+    `Last user snapshot time: ${new Date(lastUserSnapshotAt).toISOString()}`,
+    `Minutes since last user snapshot: ${elapsedUserMinutes}`,
+    'Use "last user snapshot" as the time since the user last talked in the app. Do not reset it for ordinary server keepalive.',
     'Always include "next_awake" in the final JSON. Use an ISO 8601 timestamp for when you want to be awakened next.',
     'If the next wake is more than 55 minutes away, the server will run ordinary cache keepalive every 55 minutes until that time.',
-    `距离上次对话或保活已经过去约 ${elapsedMinutes} 分钟。`,
+    `距离用户上次在 App 侧对话/上传快照已经过去约 ${elapsedUserMinutes} 分钟。`,
     '你正在服务器端执行一次远程保活/自主活动 tick。',
     '你可以先什么都不做，也可以给用户留一条消息，也可以只进行内部活动记录。',
     ...buildAgentTickToolLines(item, tools),
@@ -1237,6 +1241,7 @@ async function handleSnapshot(req, res) {
     preview,
     status: 'active',
     disabledReason: null,
+    lastUserSnapshotAt: touchedAt,
     lastTouchedAt: touchedAt,
     nextKeepaliveAt,
     nextAwakeAt: initialSchedule.nextAwakeAt,
@@ -1249,6 +1254,7 @@ async function handleSnapshot(req, res) {
   addLog('snapshot-updated', {
     conversationId: input.conversationId,
     snapshotHash: hash,
+    lastUserSnapshotAt: touchedAt,
     nextKeepaliveAt,
     nextAwakeAt: initialSchedule.nextAwakeAt,
     nextTriggerKind: initialSchedule.triggerKind,
@@ -1261,6 +1267,7 @@ async function handleSnapshot(req, res) {
     ok: true,
     status: 'active',
     snapshotHash: hash,
+    lastUserSnapshotAt: touchedAt,
     nextKeepaliveAt,
     nextAwakeAt: initialSchedule.nextAwakeAt,
     nextTriggerKind: initialSchedule.triggerKind,
@@ -1340,6 +1347,7 @@ function publicStatus() {
     snapshotHash: item.snapshotHash,
     status: item.status,
     disabledReason: item.disabledReason,
+    lastUserSnapshotAt: item.lastUserSnapshotAt || null,
     lastTouchedAt: item.lastTouchedAt,
     nextKeepaliveAt: item.nextKeepaliveAt,
     nextAwakeAt: item.nextAwakeAt || null,
@@ -1739,6 +1747,7 @@ function adminPageHtml() {
             field("Next", formatTime(item.nextKeepaliveAt)) +
             field("Awake", formatTime(item.nextAwakeAt)) +
             field("Trigger", item.nextTriggerKind || "--") +
+            field("Last user", formatTime(item.lastUserSnapshotAt)) +
             field("Last touched", formatTime(item.lastTouchedAt)) +
             field("Updated", formatTime(item.updatedAt)) +
             field("Pending", item.pendingMessageCount || 0) +
