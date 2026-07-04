@@ -20,6 +20,7 @@ const SERVERCHAN_SENDKEY = process.env.SERVERCHAN_SENDKEY || '';
 const WXPUSHER_APP_TOKEN = process.env.WXPUSHER_APP_TOKEN || '';
 const WXPUSHER_UIDS = process.env.WXPUSHER_UIDS || '';
 const WXPUSHER_TOPIC_IDS = process.env.WXPUSHER_TOPIC_IDS || '';
+const YSCLAUDE_APP_DEEPLINK_BASE = process.env.YSCLAUDE_APP_DEEPLINK_BASE || 'ysclaude://chat/';
 const PUSH_BODY_MAX_CHARS = 200;
 
 const state = {
@@ -30,6 +31,84 @@ const timers = new Map();
 
 function now() {
   return Date.now();
+}
+
+function isFiniteTimestamp(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+function normalizeFutureTimestamp(value, baseTime = now()) {
+  if (value == null || value === '') return null;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    let timestamp = value;
+    if (timestamp > 0 && timestamp < 365 * 24 * 60) {
+      timestamp = baseTime + timestamp * 60 * 1000;
+    } else if (timestamp > 1000000000 && timestamp < 100000000000) {
+      timestamp *= 1000;
+    }
+    return timestamp > baseTime + 30 * 1000 ? timestamp : null;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) return normalizeFutureTimestamp(numeric, baseTime);
+    const parsed = Date.parse(trimmed);
+    return Number.isFinite(parsed) && parsed > baseTime + 30 * 1000 ? parsed : null;
+  }
+  return null;
+}
+
+function extractDecisionNextAwakeAt(decision, baseTime = now()) {
+  if (!decision || typeof decision !== 'object') return null;
+  for (const key of ['next_awake_minutes', 'nextAwakeMinutes', 'wakeAfterMinutes', 'next_awake_in_minutes']) {
+    const timestamp = normalizeFutureTimestamp(decision[key], baseTime);
+    if (timestamp) return timestamp;
+  }
+  for (const key of ['next_awake', 'nextAwake', 'nextAwakeAt', 'next_awake_at']) {
+    const timestamp = normalizeFutureTimestamp(decision[key], baseTime);
+    if (timestamp) return timestamp;
+  }
+  return null;
+}
+
+function isAgentTickEnabled(item) {
+  return item?.agentTick ? item.agentTick.enabled === true : getAgentToolDefinitions(item?.agentTools).length > 0;
+}
+
+function nextAgentWakeAt(item, fallbackFrom = now()) {
+  if (isFiniteTimestamp(item?.nextAwakeAt)) return item.nextAwakeAt;
+  if (isAgentTickEnabled(item)) return fallbackFrom + KEEPALIVE_INTERVAL_MS;
+  return null;
+}
+
+function computeNextSchedule(item, fromTime = now()) {
+  const nextAwakeAt = nextAgentWakeAt(item, fromTime);
+  if (!nextAwakeAt) {
+    return {
+      nextKeepaliveAt: fromTime + KEEPALIVE_INTERVAL_MS,
+      nextAwakeAt: null,
+      triggerKind: 'keepalive',
+    };
+  }
+  if (nextAwakeAt - fromTime <= KEEPALIVE_INTERVAL_MS) {
+    return {
+      nextKeepaliveAt: Math.max(fromTime + 1000, nextAwakeAt),
+      nextAwakeAt,
+      triggerKind: 'agent-wake',
+    };
+  }
+  return {
+    nextKeepaliveAt: fromTime + KEEPALIVE_INTERVAL_MS,
+    nextAwakeAt,
+    triggerKind: 'keepalive',
+  };
+}
+
+function shouldRunAgentWake(item, plannedAt) {
+  if (!isAgentTickEnabled(item)) return false;
+  if (!isFiniteTimestamp(item?.nextAwakeAt)) return true;
+  return plannedAt >= item.nextAwakeAt - 1000;
 }
 
 function jsonResponse(res, statusCode, body) {
@@ -197,7 +276,9 @@ function scheduleConversation(conversationId) {
   addLog('keepalive-scheduled', {
     conversationId,
     nextKeepaliveAt: item.nextKeepaliveAt,
-    message: `next ${new Date(item.nextKeepaliveAt).toISOString()}`,
+    nextAwakeAt: item.nextAwakeAt || null,
+    nextTriggerKind: item.nextTriggerKind || null,
+    message: `${item.nextTriggerKind || 'next'} ${new Date(item.nextKeepaliveAt).toISOString()}`,
   });
   const timer = setTimeout(() => {
     runKeepalive(conversationId).catch((error) => {
@@ -328,6 +409,16 @@ function getWxPusherConfig(item) {
   return { appToken, uids, topicIds };
 }
 
+function buildConversationDeepLink(conversationId) {
+  const id = String(conversationId || '').trim();
+  if (!id) return undefined;
+  const encodedId = encodeURIComponent(id);
+  const base = String(YSCLAUDE_APP_DEEPLINK_BASE || '').trim();
+  if (!base) return `ysclaude://chat/${encodedId}`;
+  if (base.includes('{conversationId}')) return base.replaceAll('{conversationId}', encodedId);
+  return `${base.replace(/\/?$/, '/')}${encodedId}`;
+}
+
 async function sendWxPusherUserMessagePush(item, messageText) {
   const config = getWxPusherConfig(item);
   if (!config) return { sent: false, reason: 'no-app-token' };
@@ -336,6 +427,7 @@ async function sendWxPusherUserMessagePush(item, messageText) {
   }
 
   const content = String(messageText || '').trim().slice(0, PUSH_BODY_MAX_CHARS) || '（空消息）';
+  const url = buildConversationDeepLink(item?.conversationId);
   const response = await fetch('https://wxpusher.zjiecode.com/api/send/message', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json;charset=utf-8' },
@@ -344,6 +436,7 @@ async function sendWxPusherUserMessagePush(item, messageText) {
       content,
       summary: 'Claude在呼叫你……',
       contentType: 1,
+      url,
       uids: config.uids.length ? config.uids : undefined,
       topicIds: config.topicIds.length ? config.topicIds : undefined,
     }),
@@ -611,13 +704,21 @@ function buildAgentTickToolLines(item, tools) {
 
 function buildAgentTickPrompt(item, plannedAt, tools) {
   const elapsedMinutes = Math.max(1, Math.round((plannedAt - (item.lastTouchedAt || item.updatedAt || plannedAt)) / 60000));
+  const currentTime = now();
   return [
+    `Current server time: ${new Date(currentTime).toISOString()}`,
+    `This wake was planned for: ${new Date(plannedAt).toISOString()}`,
+    'Always include "next_awake" in the final JSON. Use an ISO 8601 timestamp for when you want to be awakened next.',
+    'If the next wake is more than 55 minutes away, the server will run ordinary cache keepalive every 55 minutes until that time.',
     `距离上次对话或保活已经过去约 ${elapsedMinutes} 分钟。`,
     '你正在服务器端执行一次远程保活/自主活动 tick。',
     '你可以先什么都不做，也可以给用户留一条消息，也可以只进行内部活动记录。',
     ...buildAgentTickToolLines(item, tools),
     '最终必须只输出 JSON，不要 Markdown，不要额外解释：',
-    '{"action":"noop","reason":"..."}',
+    '{"action":"noop","reason":"...","next_awake":"2026-07-04T12:30:00.000Z"}',
+    '{"action":"user_message","message":"...","reason":"...","next_awake":"2026-07-04T12:30:00.000Z"}',
+    'JSON without "next_awake" is invalid.',
+    'Every final JSON object must include "next_awake".',
     '{"action":"user_message","message":"发给用户的消息","reason":"..."}',
     '{"action":"agent_activity","summary":"内部活动摘要","messagesToAppend":[{"role":"assistant","content":"可选：要写入后续上下文的简短记录"}]}',
   ].join('\n');
@@ -643,11 +744,13 @@ function parseJsonDecision(content) {
 
 function normalizeDecision(decision) {
   const action = decision?.action;
+  const nextAwakeAt = extractDecisionNextAwakeAt(decision);
   if (action === 'user_message' && typeof decision.message === 'string' && decision.message.trim()) {
     return {
       action,
       message: decision.message.trim(),
       reason: typeof decision.reason === 'string' ? decision.reason : '',
+      nextAwakeAt,
     };
   }
   if (action === 'agent_activity') {
@@ -656,11 +759,13 @@ function normalizeDecision(decision) {
       summary: String(decision.summary || decision.reason || '').trim() || '远程自主活动完成。',
       messagesToAppend: Array.isArray(decision.messagesToAppend) ? decision.messagesToAppend : [],
       reason: typeof decision.reason === 'string' ? decision.reason : '',
+      nextAwakeAt,
     };
   }
   return {
     action: 'noop',
     reason: typeof decision?.reason === 'string' ? decision.reason : '',
+    nextAwakeAt,
   };
 }
 
@@ -858,9 +963,11 @@ async function runKeepalive(conversationId) {
     let usedMaxTokens = 0;
     const agentToolDefinitions = getAgentToolDefinitions(item.agentTools);
     // agentTick.enabled 显式控制是否执行自主 tick；旧快照无该字段时退回"有工具才 tick"
-    const tickEnabled = item.agentTick ? item.agentTick.enabled === true : agentToolDefinitions.length > 0;
-    if (tickEnabled) {
+    const runAgentWake = shouldRunAgentWake(item, plannedAt);
+    let nextAwakeDecisionAt = null;
+    if (runAgentWake) {
       const { decision, toolTranscript } = await runAgentTick(conversationId, item, plannedAt);
+      nextAwakeDecisionAt = decision.nextAwakeAt;
       const applyResult = appendAgentDecisionToSnapshot(item, decision, toolTranscript);
       if (applyResult.changed) {
         item.snapshotHash = snapshotHash(item.request);
@@ -930,7 +1037,13 @@ async function runKeepalive(conversationId) {
     }
 
     item.lastTouchedAt = now();
-    item.nextKeepaliveAt = item.lastTouchedAt + KEEPALIVE_INTERVAL_MS;
+    if (runAgentWake) {
+      item.nextAwakeAt = nextAwakeDecisionAt || item.lastTouchedAt + KEEPALIVE_INTERVAL_MS;
+    }
+    const nextSchedule = computeNextSchedule(item, item.lastTouchedAt);
+    item.nextAwakeAt = nextSchedule.nextAwakeAt;
+    item.nextKeepaliveAt = nextSchedule.nextKeepaliveAt;
+    item.nextTriggerKind = nextSchedule.triggerKind;
     item.lastError = null;
     item.updatedAt = item.lastTouchedAt;
     addLog('keepalive-ok', {
@@ -938,9 +1051,11 @@ async function runKeepalive(conversationId) {
       snapshotHash: item.snapshotHash,
       maxTokens: usedMaxTokens,
       touchedAt: item.lastTouchedAt,
+      nextAwakeAt: item.nextAwakeAt,
       nextKeepaliveAt: item.nextKeepaliveAt,
+      nextTriggerKind: item.nextTriggerKind,
       preview: item.preview,
-      message: `next ${new Date(item.nextKeepaliveAt).toISOString()}`,
+      message: `${item.nextTriggerKind} ${new Date(item.nextKeepaliveAt).toISOString()}`,
     });
     scheduleConversation(conversationId);
     await saveState();
@@ -948,6 +1063,7 @@ async function runKeepalive(conversationId) {
     item.lastError = error.message || String(error);
     item.lastFailedAt = now();
     item.nextKeepaliveAt = Math.min(now() + 5 * 60 * 1000, plannedAt + 10 * 60 * 1000);
+    item.nextTriggerKind = 'retry';
     item.updatedAt = now();
     addLog('keepalive-error', {
       conversationId,
@@ -1045,10 +1161,14 @@ function normalizeAgentTools(agentTools) {
 async function handleSnapshot(req, res) {
   const input = validateSnapshot(await readJsonBody(req));
   const touchedAt = now();
-  const nextKeepaliveAt = touchedAt + KEEPALIVE_INTERVAL_MS;
   const hash = snapshotHash(input.request);
   const preview = buildSnapshotPreview(input.request);
   const existing = state.conversations[input.conversationId] || {};
+  const initialSchedule = computeNextSchedule(
+    { agentTools: input.agentTools, agentTick: input.agentTick },
+    touchedAt
+  );
+  const nextKeepaliveAt = initialSchedule.nextKeepaliveAt;
 
   if (isInQuietHours(nextKeepaliveAt, input.quietHours)) {
     clearConversationTimer(input.conversationId);
@@ -1065,6 +1185,8 @@ async function handleSnapshot(req, res) {
       disabledReason: 'quiet-hours',
       lastTouchedAt: touchedAt,
       nextKeepaliveAt: null,
+      nextAwakeAt: initialSchedule.nextAwakeAt,
+      nextTriggerKind: null,
       updatedAt: touchedAt,
       pendingMessages: existing.pendingMessages || [],
       activityLog: existing.activityLog || [],
@@ -1094,6 +1216,8 @@ async function handleSnapshot(req, res) {
     disabledReason: null,
     lastTouchedAt: touchedAt,
     nextKeepaliveAt,
+    nextAwakeAt: initialSchedule.nextAwakeAt,
+    nextTriggerKind: initialSchedule.triggerKind,
     updatedAt: touchedAt,
     lastError: null,
     pendingMessages: existing.pendingMessages || [],
@@ -1103,8 +1227,10 @@ async function handleSnapshot(req, res) {
     conversationId: input.conversationId,
     snapshotHash: hash,
     nextKeepaliveAt,
+    nextAwakeAt: initialSchedule.nextAwakeAt,
+    nextTriggerKind: initialSchedule.triggerKind,
     preview,
-    message: `next ${new Date(nextKeepaliveAt).toISOString()}`,
+    message: `${initialSchedule.triggerKind} ${new Date(nextKeepaliveAt).toISOString()}`,
   });
   scheduleConversation(input.conversationId);
   await saveState();
@@ -1113,6 +1239,8 @@ async function handleSnapshot(req, res) {
     status: 'active',
     snapshotHash: hash,
     nextKeepaliveAt,
+    nextAwakeAt: initialSchedule.nextAwakeAt,
+    nextTriggerKind: initialSchedule.triggerKind,
   });
 }
 
@@ -1189,6 +1317,8 @@ function publicStatus() {
     disabledReason: item.disabledReason,
     lastTouchedAt: item.lastTouchedAt,
     nextKeepaliveAt: item.nextKeepaliveAt,
+    nextAwakeAt: item.nextAwakeAt || null,
+    nextTriggerKind: item.nextTriggerKind || null,
     lastError: item.lastError,
     updatedAt: item.updatedAt,
     preview: item.preview,
@@ -1582,6 +1712,8 @@ function adminPageHtml() {
             field("Model", preview.model || "—") +
             field("Messages", preview.messageCount ?? "—") +
             field("Next", formatTime(item.nextKeepaliveAt)) +
+            field("Awake", formatTime(item.nextAwakeAt)) +
+            field("Trigger", item.nextTriggerKind || "--") +
             field("Last touched", formatTime(item.lastTouchedAt)) +
             field("Updated", formatTime(item.updatedAt)) +
             field("Pending", item.pendingMessageCount || 0) +
