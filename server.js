@@ -28,6 +28,7 @@ const state = {
   logs: [],
 };
 const timers = new Map();
+let quietHoursPurgeTimer = null;
 
 function now() {
   return Date.now();
@@ -259,6 +260,67 @@ function isInQuietHours(timestamp, quietHours) {
   return current >= start || current < end;
 }
 
+function nextQuietStartAt(quietHours, reference = now()) {
+  if (!quietHours?.enabled) return null;
+  const start = Number(quietHours.startMinutes);
+  const end = Number(quietHours.endMinutes);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start === end) return null;
+  if (isInQuietHours(reference, quietHours)) return reference;
+
+  const date = new Date(reference);
+  const current = minutesOfDay(reference);
+  const daysToAdd = current < start ? 0 : 1;
+  date.setDate(date.getDate() + daysToAdd);
+  date.setHours(Math.floor(start / 60), start % 60, 0, 0);
+  return date.getTime();
+}
+
+function clearAllConversationTimers() {
+  for (const timer of timers.values()) {
+    clearTimeout(timer);
+  }
+  timers.clear();
+}
+
+function clearQuietHoursPurgeTimer() {
+  if (!quietHoursPurgeTimer) return;
+  clearTimeout(quietHoursPurgeTimer);
+  quietHoursPurgeTimer = null;
+}
+
+async function purgeAllStateForQuietHours(reason = 'quiet-hours') {
+  const conversationCount = Object.keys(state.conversations).length;
+  const logCount = state.logs.length;
+  clearAllConversationTimers();
+  clearQuietHoursPurgeTimer();
+  state.conversations = {};
+  state.logs = [];
+  console.log(`[quiet-hours-purge] ${reason}; cleared ${conversationCount} conversations and ${logCount} logs`);
+  await saveState();
+}
+
+function scheduleQuietHoursPurge() {
+  clearQuietHoursPurgeTimer();
+  const candidates = Object.values(state.conversations)
+    .map((item) => ({
+      conversationId: item.conversationId,
+      quietHours: item.quietHours,
+      purgeAt: nextQuietStartAt(item.quietHours),
+    }))
+    .filter((item) => Number.isFinite(item.purgeAt));
+  if (candidates.length === 0) return;
+
+  candidates.sort((a, b) => a.purgeAt - b.purgeAt);
+  const nextPurge = candidates[0];
+  const delay = Math.max(1000, nextPurge.purgeAt - now());
+  console.log(`[quiet-hours-purge-scheduled] ${new Date(nextPurge.purgeAt).toISOString()}`);
+  quietHoursPurgeTimer = setTimeout(() => {
+    purgeAllStateForQuietHours('quiet-hours-start').catch((error) => {
+      console.warn('[quiet-hours-purge] failed:', error.message);
+    });
+  }, delay);
+}
+
 function clearConversationTimer(conversationId) {
   const timer = timers.get(conversationId);
   if (timer) {
@@ -286,6 +348,7 @@ function scheduleConversation(conversationId) {
     });
   }, delay);
   timers.set(conversationId, timer);
+  scheduleQuietHoursPurge();
 }
 
 function applyThinkingConfig(body, request) {
@@ -942,20 +1005,7 @@ async function runKeepalive(conversationId) {
 
   const plannedAt = item.nextKeepaliveAt || now();
   if (isInQuietHours(plannedAt, item.quietHours)) {
-    item.status = 'disabled';
-    item.disabledReason = 'quiet-hours';
-    item.nextKeepaliveAt = null;
-    item.updatedAt = now();
-    addLog('keepalive-skipped', {
-      conversationId,
-      reason: 'quiet-hours',
-      plannedAt,
-      snapshotHash: item.snapshotHash,
-      preview: item.preview,
-      message: 'quiet-hours',
-    });
-    await saveState();
-    clearConversationTimer(conversationId);
+    await purgeAllStateForQuietHours('keepalive-in-quiet-hours');
     return;
   }
 
@@ -1171,35 +1221,8 @@ async function handleSnapshot(req, res) {
   const nextKeepaliveAt = initialSchedule.nextKeepaliveAt;
 
   if (isInQuietHours(nextKeepaliveAt, input.quietHours)) {
-    clearConversationTimer(input.conversationId);
-    state.conversations[input.conversationId] = {
-      conversationId: input.conversationId,
-      snapshotHash: hash,
-      request: input.request,
-      quietHours: input.quietHours,
-      agentTools: input.agentTools,
-      agentTick: input.agentTick,
-      push: input.push || existing.push,
-      preview,
-      status: 'disabled',
-      disabledReason: 'quiet-hours',
-      lastTouchedAt: touchedAt,
-      nextKeepaliveAt: null,
-      nextAwakeAt: initialSchedule.nextAwakeAt,
-      nextTriggerKind: null,
-      updatedAt: touchedAt,
-      pendingMessages: existing.pendingMessages || [],
-      activityLog: existing.activityLog || [],
-    };
-    addLog('snapshot-disabled', {
-      conversationId: input.conversationId,
-      snapshotHash: hash,
-      reason: 'quiet-hours',
-      preview,
-      message: 'quiet-hours',
-    });
-    await saveState();
-    jsonResponse(res, 200, { ok: true, status: 'disabled', reason: 'quiet-hours' });
+    await purgeAllStateForQuietHours('snapshot-next-trigger-in-quiet-hours');
+    jsonResponse(res, 200, { ok: true, status: 'cleared', reason: 'quiet-hours' });
     return;
   }
 
@@ -1268,6 +1291,7 @@ async function handleDisable(req, res) {
     message: 'client-disable',
   });
   await saveState();
+  scheduleQuietHoursPurge();
   jsonResponse(res, 200, { ok: true, status: 'disabled' });
 }
 
@@ -1289,6 +1313,7 @@ async function deleteConversation(conversationId) {
     message: 'deleted',
   });
   await saveState();
+  scheduleQuietHoursPurge();
   return existing;
 }
 
@@ -1990,6 +2015,7 @@ for (const item of Object.values(state.conversations)) {
     scheduleConversation(item.conversationId);
   }
 }
+scheduleQuietHoursPurge();
 
 createServer(route).listen(PORT, HOST, () => {
   console.log(`YSClaude keepalive server listening on http://${HOST}:${PORT}`);
