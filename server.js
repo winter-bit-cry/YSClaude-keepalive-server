@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { createHash, createSign, randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,9 +16,8 @@ const MAX_LOG_ENTRIES = Number(process.env.MAX_LOG_ENTRIES || 300);
 const SNAPSHOT_PREVIEW_TAIL_CHARS = 120;
 const AGENT_TICK_MAX_TOKENS = Number(process.env.AGENT_TICK_MAX_TOKENS || 800);
 const AGENT_ACTIVITY_MAX_TOOL_ROUNDS = Number(process.env.AGENT_ACTIVITY_MAX_TOOL_ROUNDS || 4);
-const FCM_SERVICE_ACCOUNT_JSON = process.env.FCM_SERVICE_ACCOUNT_JSON || '';
-const FCM_SERVICE_ACCOUNT_FILE = process.env.FCM_SERVICE_ACCOUNT_FILE || '';
-const FCM_PUSH_BODY_MAX_CHARS = 200;
+const SERVERCHAN_SENDKEY = process.env.SERVERCHAN_SENDKEY || '';
+const PUSH_BODY_MAX_CHARS = 200;
 
 const state = {
   conversations: {},
@@ -244,136 +243,51 @@ function shouldRetryWithOneToken(error) {
   return text.includes('max_tokens') || text.includes('max tokens') || text.includes('greater than 0');
 }
 
-let fcmServiceAccount = null;
-const fcmAccessTokenCache = { token: null, expiresAt: 0 };
+// ─── Server酱推送 ────────────────────────────────────────────
+// 兼容两代 SendKey：SCT 开头走 sctapi.ftqq.com；sctp{uid}t 开头走 Server酱3 的 push.ft07.com。
+function buildServerChanUrl(sendKey) {
+  const key = String(sendKey || '').trim();
+  if (!key) return null;
+  const sc3Match = key.match(/^sctp(\d+)t/i);
+  if (sc3Match) {
+    return `https://${sc3Match[1]}.push.ft07.com/send/${key}.send`;
+  }
+  return `https://sctapi.ftqq.com/${key}.send`;
+}
 
-async function loadFcmServiceAccount() {
-  let raw = FCM_SERVICE_ACCOUNT_JSON;
-  if (!raw && FCM_SERVICE_ACCOUNT_FILE) {
-    try {
-      raw = await readFile(FCM_SERVICE_ACCOUNT_FILE, 'utf8');
-    } catch (error) {
-      console.warn('[fcm] service account file read failed:', error.message);
-      return;
-    }
+function getServerChanSendKey(item) {
+  return String(item?.push?.serverChanSendKey || SERVERCHAN_SENDKEY || '').trim();
+}
+
+async function sendServerChanUserMessagePush(item, messageText) {
+  const sendKey = getServerChanSendKey(item);
+  if (!sendKey) return { sent: false, reason: 'no-sendkey' };
+  const url = buildServerChanUrl(sendKey);
+  if (!url) return { sent: false, reason: 'invalid-sendkey' };
+
+  const desp = String(messageText || '').trim().slice(0, PUSH_BODY_MAX_CHARS);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json;charset=utf-8' },
+    body: JSON.stringify({
+      title: 'Claude在呼叫你……',
+      desp: desp || '（空消息）',
+      short: desp || undefined,
+    }),
+  });
+  const text = await response.text().catch(() => '');
+  if (!response.ok) {
+    throw new Error(`ServerChan send ${response.status}: ${text.slice(0, 300)}`);
   }
-  if (!raw) {
-    console.warn('[fcm] no service account configured, push disabled (set FCM_SERVICE_ACCOUNT_JSON or FCM_SERVICE_ACCOUNT_FILE)');
-    return;
-  }
+  let data = null;
   try {
-    const parsed = JSON.parse(raw);
-    if (!parsed.client_email || !parsed.private_key || !parsed.project_id) {
-      throw new Error('missing client_email/private_key/project_id');
-    }
-    fcmServiceAccount = parsed;
-    console.log(`[fcm] push enabled for project ${parsed.project_id}`);
-  } catch (error) {
-    console.warn('[fcm] service account parse failed, push disabled:', error.message);
+    data = JSON.parse(text);
+  } catch {
+    // 非 JSON 响应但 HTTP 成功，按成功处理
   }
-}
-
-function base64url(input) {
-  return Buffer.from(input).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-async function getFcmAccessToken() {
-  if (!fcmServiceAccount) throw new Error('FCM service account not configured');
-  if (fcmAccessTokenCache.token && fcmAccessTokenCache.expiresAt > now()) {
-    return fcmAccessTokenCache.token;
-  }
-  const iat = Math.floor(now() / 1000);
-  const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
-  const claims = base64url(JSON.stringify({
-    iss: fcmServiceAccount.client_email,
-    scope: 'https://www.googleapis.com/auth/firebase.messaging',
-    aud: 'https://oauth2.googleapis.com/token',
-    iat,
-    exp: iat + 3600,
-  }));
-  const signingInput = `${header}.${claims}`;
-  const signature = createSign('RSA-SHA256').update(signingInput).sign(fcmServiceAccount.private_key);
-  const jwt = `${signingInput}.${base64url(signature)}`;
-
-  const response = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: `grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer')}&assertion=${encodeURIComponent(jwt)}`,
-  });
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`FCM oauth ${response.status}: ${text}`);
-  }
-  const data = await response.json();
-  if (!data.access_token) throw new Error('FCM oauth response missing access_token');
-  fcmAccessTokenCache.token = data.access_token;
-  fcmAccessTokenCache.expiresAt = now() + Math.max(60, Number(data.expires_in || 3600) - 600) * 1000;
-  return fcmAccessTokenCache.token;
-}
-
-function isFcmTokenInvalidError(status, bodyText) {
-  if (status === 404) return true;
-  const text = String(bodyText || '');
-  return text.includes('UNREGISTERED') || text.includes('INVALID_ARGUMENT');
-}
-
-async function sendFcmUserMessagePush(item, messageText) {
-  if (!fcmServiceAccount) return { sent: false, reason: 'no-service-account' };
-  const fcmToken = item.push?.fcmToken;
-  if (!fcmToken) return { sent: false, reason: 'no-token' };
-
-  const body = String(messageText || '').trim().slice(0, FCM_PUSH_BODY_MAX_CHARS);
-  const payload = {
-    message: {
-      token: fcmToken,
-      notification: {
-        title: 'Claude在呼叫你……',
-        body,
-      },
-      android: {
-        priority: 'high',
-        notification: { channel_id: 'chat-replies-message-alert-v2' },
-      },
-      data: {
-        kind: 'remote-agent-user-message',
-        conversationId: String(item.conversationId || ''),
-      },
-    },
-  };
-  const url = `https://fcm.googleapis.com/v1/projects/${fcmServiceAccount.project_id}/messages:send`;
-
-  let response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${await getFcmAccessToken()}`,
-    },
-    body: JSON.stringify(payload),
-  });
-  if (response.status === 401) {
-    fcmAccessTokenCache.token = null;
-    fcmAccessTokenCache.expiresAt = 0;
-    response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${await getFcmAccessToken()}`,
-      },
-      body: JSON.stringify(payload),
-    });
-  }
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    if (isFcmTokenInvalidError(response.status, text)) {
-      delete item.push;
-      addLog('fcm-token-invalid', {
-        conversationId: item.conversationId,
-        status: response.status,
-        message: `token invalidated (${response.status})`,
-      });
-      return { sent: false, reason: 'token-invalid' };
-    }
-    throw new Error(`FCM send ${response.status}: ${text}`);
+  if (data && typeof data.code === 'number' && data.code !== 0) {
+    // code 非 0 通常是 SendKey 错误或超出配额
+    throw new Error(`ServerChan error ${data.code}: ${data.message || text.slice(0, 300)}`);
   }
   return { sent: true };
 }
@@ -868,14 +782,14 @@ async function runKeepalive(conversationId) {
       if (applyResult.logType === 'agent-user-message') {
         // 推送失败不能中断保活周期
         try {
-          const pushResult = await sendFcmUserMessagePush(item, decision.message);
-          addLog(pushResult.sent ? 'fcm-push-ok' : 'fcm-push-skipped', {
+          const pushResult = await sendServerChanUserMessagePush(item, decision.message);
+          addLog(pushResult.sent ? 'push-ok' : 'push-skipped', {
             conversationId,
             reason: pushResult.reason,
             message: pushResult.sent ? 'push sent' : `skipped: ${pushResult.reason}`,
           });
         } catch (error) {
-          addLog('fcm-push-error', {
+          addLog('push-error', {
             conversationId,
             error: error.message || String(error),
             message: error.message || String(error),
@@ -969,9 +883,9 @@ function normalizeAgentTick(agentTick) {
 
 function normalizePushConfig(push) {
   if (!push || typeof push !== 'object') return undefined;
-  const fcmToken = typeof push.fcmToken === 'string' ? push.fcmToken.trim() : '';
-  if (!fcmToken) return undefined;
-  return { fcmToken };
+  const serverChanSendKey = typeof push.serverChanSendKey === 'string' ? push.serverChanSendKey.trim() : '';
+  if (!serverChanSendKey) return undefined;
+  return { serverChanSendKey };
 }
 
 function normalizeAgentTools(agentTools) {
@@ -1148,7 +1062,7 @@ function publicStatus() {
     preview: item.preview,
     agentToolsEnabled: getAgentToolDefinitions(item.agentTools).map((tool) => tool.function.name),
     agentTickEnabled: item.agentTick ? item.agentTick.enabled === true : getAgentToolDefinitions(item.agentTools).length > 0,
-    pushConfigured: Boolean(item.push?.fcmToken),
+    pushConfigured: Boolean(getServerChanSendKey(item)),
     pendingMessageCount: (item.pendingMessages || []).filter((message) => !message.consumed).length,
     activityCount: (item.activityLog || []).filter((entry) => !entry.consumed).length,
   }));
@@ -1659,10 +1573,10 @@ async function handlePushToken(req, res) {
   const input = await readJsonBody(req);
   const push = normalizePushConfig(input.push || input);
   if (!push) {
-    jsonResponse(res, 400, { ok: false, error: 'fcmToken is required' });
+    jsonResponse(res, 400, { ok: false, error: 'serverChanSendKey is required' });
     return;
   }
-  // 单用户服务器：token 轮换时更新所有会话
+  // 单用户服务器：SendKey 更新时同步到所有会话
   let updated = 0;
   for (const item of Object.values(state.conversations)) {
     item.push = push;
@@ -1674,6 +1588,23 @@ async function handlePushToken(req, res) {
   });
   await saveState();
   jsonResponse(res, 200, { ok: true, updated });
+}
+
+async function handlePushTest(req, res) {
+  const input = await readJsonBody(req);
+  const push = normalizePushConfig(input.push || input);
+  const item = { push };
+  try {
+    const result = await sendServerChanUserMessagePush(item, input.message || 'YSClaude 推送测试：Server酱通道工作正常。');
+    addLog(result.sent ? 'push-test-ok' : 'push-test-skipped', {
+      reason: result.reason,
+      message: result.sent ? 'test push sent' : `skipped: ${result.reason}`,
+    });
+    jsonResponse(res, result.sent ? 200 : 400, { ok: result.sent, reason: result.reason });
+  } catch (error) {
+    addLog('push-test-error', { error: error.message || String(error), message: error.message || String(error) });
+    jsonResponse(res, 502, { ok: false, error: error.message || String(error) });
+  }
 }
 
 async function route(req, res) {
@@ -1755,6 +1686,10 @@ async function route(req, res) {
       await handlePushToken(req, res);
       return;
     }
+    if (req.method === 'POST' && url.pathname === '/v1/keepalive/push-test') {
+      await handlePushTest(req, res);
+      return;
+    }
     jsonResponse(res, 404, { ok: false, error: 'Not found' });
   } catch (error) {
     jsonResponse(res, error.statusCode || 400, { ok: false, error: error.message || String(error) });
@@ -1762,7 +1697,11 @@ async function route(req, res) {
 }
 
 await loadState();
-await loadFcmServiceAccount();
+if (SERVERCHAN_SENDKEY) {
+  console.log('[push] ServerChan fallback SendKey configured');
+} else {
+  console.log('[push] no SERVERCHAN_SENDKEY env; push uses per-conversation SendKey from client');
+}
 for (const item of Object.values(state.conversations)) {
   if (item.status === 'active') {
     scheduleConversation(item.conversationId);

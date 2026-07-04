@@ -11,12 +11,12 @@
 ```text
 KEEPALIVE_AUTH_TOKEN=换成你自己的长随机令牌
 KEEPALIVE_INTERVAL_MS=3300000
-FCM_SERVICE_ACCOUNT_FILE=/etc/ysclaude/firebase-service-account.json   # 可选：启用 FCM 推送
+SERVERCHAN_SENDKEY=SCTxxxxxxxx   # 可选：Server酱推送兜底 SendKey
 ```
 
-Firebase 服务账号 JSON 不建议提交到 GitHub。推荐在 Zeabur 的 Config Editor 新增配置文件，路径填 `/etc/ysclaude/firebase-service-account.json`，内容粘贴完整的服务账号 JSON，然后只把上面的 `FCM_SERVICE_ACCOUNT_FILE` 环境变量设为这个短路径。Zeabur 的配置文件会在服务启动时自动挂载；普通文件管理中未挂载的文件重启后可能丢失。
+推送走 [Server酱](https://sct.ftqq.com/)：AI 给用户留言时，服务端调用 Server酱把留言前 200 字推到你的微信/App。SendKey 优先取 App 快照上报的 `push.serverChanSendKey`，没有时退回环境变量 `SERVERCHAN_SENDKEY`。两处都未配置时推送静默禁用，其余功能不受影响。
 
-如果部署平台支持较长的多行/单行环境变量，也可以用 `FCM_SERVICE_ACCOUNT_JSON={"type":"service_account",...}` 直接配置。未配置时推送功能静默禁用，其余功能不受影响。
+同时兼容 Server酱³（`sctp{uid}t...` 形式的 SendKey，走 `push.ft07.com`）和经典版（`SCT...`，走 `sctapi.ftqq.com`）。
 
 `PORT` 由 Zeabur 注入，不需要手动设置。服务会读取 `process.env.PORT`。
 
@@ -75,7 +75,8 @@ $env:KEEPALIVE_INTERVAL_MS="3300000"
 - `POST /v1/keepalive/disable`：取消当前对话保活。
 - `POST /v1/keepalive/delete`：删除指定对话快照，JSON body: `{ "conversationId": "..." }`。
 - `DELETE /v1/keepalive/conversations/:conversationId`：删除指定对话快照。
-- `POST /v1/keepalive/push-token`：上报/轮换 FCM 设备 token（更新所有会话）。
+- `POST /v1/keepalive/push-token`：上报/更新 Server酱 SendKey（更新所有会话），JSON body: `{ "serverChanSendKey": "SCT..." }`。
+- `POST /v1/keepalive/push-test`：发送一条测试推送，JSON body: `{ "serverChanSendKey": "SCT...", "message": "可选" }`；不带 SendKey 时用环境变量兜底。
 
 如果设置了 `KEEPALIVE_AUTH_TOKEN`，请求需要带：
 
@@ -107,8 +108,7 @@ curl.exe -X POST `
 - 快照携带 `agentTick.enabled` 时以它决定是否执行远程 AI tick（App 设置里的「远程自主活动」开关，默认开）；旧快照无该字段时退回"包含远程工具配置才 tick"。tick 无需工具也可执行——AI 会被告知已过去的时间，可选择不行动或给用户留言。
 - 远程 AI tick 只支持云端记忆库与 Tavily 搜索；不会执行手机本地工具、Shizuku、网页控制或自定义 MCP。
 - AI 给用户留言会写入 `pendingMessages`，自主活动会写入 `activityLog`，两者都会更新服务端保存的快照上下文。追加进快照的消息统一为 `assistant` 角色，App 端会逐字插入对话以保持缓存前缀一致。
-- AI 给用户留言时，如已配置 `FCM_SERVICE_ACCOUNT_JSON` 或 `FCM_SERVICE_ACCOUNT_FILE`，且 App 上报过设备 token，会通过 FCM 推送系统通知（显示留言前 200 字）；推送失败不影响保活。
-- 推荐用 `FCM_SERVICE_ACCOUNT_FILE` 指向服务器上的 Firebase 服务账号 JSON；不要把服务账号密钥提交到仓库。
+- AI 给用户留言时，如配置了 Server酱 SendKey（快照上报或 `SERVERCHAN_SENDKEY` 环境变量），会通过 Server酱推送通知（显示留言前 200 字）；推送失败不影响保活。
 - 如果保活点落在非保活时段内，本轮保活会取消，缓存自然过期。
 - App 后续再次成功使用 cache 后，会重新上传快照并恢复保活循环。
 - 如果 App 最后一次成功请求没有使用 `1h` cache，会调用 disable 取消该对话保活。
