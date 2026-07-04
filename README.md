@@ -28,6 +28,14 @@ https://你的-zeabur-域名/health
 
 看到 `{ "ok": true }` 即可。
 
+管理面板在：
+
+```text
+https://你的-zeabur-域名/admin
+```
+
+面板本身不会直接暴露快照数据；进入后填写服务地址和 `KEEPALIVE_AUTH_TOKEN`，即可查看、停用或删除服务端保存的快照会话。
+
 5. 在 YSClaude App 中进入：
 
 `设置 -> 对话设置 -> Prompt 缓存 -> 保活方式 -> 远程保活`
@@ -65,6 +73,8 @@ $env:KEEPALIVE_INTERVAL_MS="3300000"
 - `POST /v1/keepalive/activity/ack`：标记自主活动记录已消费。
 - `POST /v1/keepalive/snapshot`：上传并覆盖当前对话快照。
 - `POST /v1/keepalive/disable`：取消当前对话保活。
+- `POST /v1/keepalive/delete`：删除指定对话快照，JSON body: `{ "conversationId": "..." }`。
+- `DELETE /v1/keepalive/conversations/:conversationId`：删除指定对话快照。
 - `POST /v1/keepalive/push-token`：上报/轮换 FCM 设备 token（更新所有会话）。
 
 如果设置了 `KEEPALIVE_AUTH_TOKEN`，请求需要带：
@@ -77,6 +87,16 @@ Authorization: Bearer <token>
 
 ```powershell
 curl.exe -H "Authorization: Bearer <token>" "https://你的-zeabur-域名/v1/keepalive/logs?limit=50"
+```
+
+删除快照示例：
+
+```powershell
+curl.exe -X POST `
+  -H "Authorization: Bearer <token>" `
+  -H "Content-Type: application/json" `
+  -d "{\"conversationId\":\"要删除的 conversationId\"}" `
+  "https://你的-zeabur-域名/v1/keepalive/delete"
 ```
 
 ## 行为

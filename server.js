@@ -39,6 +39,14 @@ function jsonResponse(res, statusCode, body) {
   res.end(payload);
 }
 
+function htmlResponse(res, statusCode, html) {
+  res.writeHead(statusCode, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Length': Buffer.byteLength(html),
+  });
+  res.end(html);
+}
+
 function normalizeToken(value) {
   return String(value || '').replace(/^Bearer\s+/i, '').trim();
 }
@@ -1089,6 +1097,44 @@ async function handleDisable(req, res) {
   jsonResponse(res, 200, { ok: true, status: 'disabled' });
 }
 
+async function deleteConversation(conversationId) {
+  const id = String(conversationId || '').trim();
+  if (!id) {
+    const error = new Error('conversationId is required');
+    error.statusCode = 400;
+    throw error;
+  }
+  const existing = getConversationOr404(id);
+  clearConversationTimer(id);
+  delete state.conversations[id];
+  addLog('conversation-deleted', {
+    conversationId: id,
+    snapshotHash: existing.snapshotHash,
+    status: existing.status,
+    preview: existing.preview,
+    message: 'deleted',
+  });
+  await saveState();
+  return existing;
+}
+
+async function handleDeleteConversation(req, res, conversationIdFromPath = '') {
+  let conversationId = String(conversationIdFromPath || '').trim();
+  if (!conversationId && req.method !== 'GET') {
+    const input = await readJsonBody(req);
+    conversationId = String(input.conversationId || '').trim();
+  }
+  const deleted = await deleteConversation(conversationId);
+  jsonResponse(res, 200, {
+    ok: true,
+    deleted: {
+      conversationId: deleted.conversationId || conversationId,
+      snapshotHash: deleted.snapshotHash || null,
+      status: deleted.status || null,
+    },
+  });
+}
+
 function publicStatus() {
   return Object.values(state.conversations).map((item) => ({
     conversationId: item.conversationId,
@@ -1138,6 +1184,447 @@ function publicActivity(conversationId, limit = 100) {
     .filter((entry) => !entry.consumed)
     .slice(-safeLimit)
     .reverse();
+}
+
+function adminPageHtml() {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>YSClaude Keepalive Admin</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f4ee;
+      --panel: #ffffff;
+      --text: #171412;
+      --muted: #746b62;
+      --border: #e4ded5;
+      --primary: #c96f13;
+      --danger: #dc2626;
+      --success: #15803d;
+      --shadow: 0 10px 28px rgba(44, 31, 20, 0.08);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #12100d;
+        --panel: #211c17;
+        --text: #f7f2ea;
+        --muted: #baafa3;
+        --border: #3a3027;
+        --primary: #f59e0b;
+        --danger: #f87171;
+        --success: #4ade80;
+        --shadow: none;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+    main {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 28px 0 48px;
+    }
+    header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(24px, 4vw, 36px);
+      letter-spacing: 0;
+    }
+    .subtitle {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .controls {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) minmax(160px, 260px) auto;
+      gap: 10px;
+      align-items: end;
+    }
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    input {
+      width: 100%;
+      min-height: 40px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 10px;
+      background: transparent;
+      color: var(--text);
+      font: inherit;
+    }
+    button {
+      min-height: 40px;
+      border: 1px solid var(--primary);
+      border-radius: 8px;
+      padding: 8px 12px;
+      background: transparent;
+      color: var(--primary);
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.primary {
+      background: var(--primary);
+      color: #fff;
+    }
+    button.danger {
+      border-color: var(--danger);
+      color: var(--danger);
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    .summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 10px;
+    }
+    .summary strong { color: var(--text); }
+    .grid {
+      display: grid;
+      gap: 12px;
+    }
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      background: color-mix(in srgb, var(--panel), var(--bg) 20%);
+    }
+    .card-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+    }
+    .id {
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+      word-break: break-all;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border-radius: 999px;
+      padding: 3px 9px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .pill.active {
+      border-color: color-mix(in srgb, var(--success), transparent 45%);
+      color: var(--success);
+    }
+    .pill.disabled {
+      border-color: color-mix(in srgb, var(--danger), transparent 45%);
+      color: var(--danger);
+    }
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin: 12px 0;
+    }
+    .field {
+      border-top: 1px solid var(--border);
+      padding-top: 8px;
+      min-width: 0;
+    }
+    .field-name {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .field-value {
+      margin-top: 3px;
+      font-size: 13px;
+      word-break: break-word;
+    }
+    .tail {
+      color: var(--muted);
+      font-size: 13px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .notice {
+      min-height: 22px;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+    .notice.error { color: var(--danger); }
+    .empty {
+      color: var(--muted);
+      text-align: center;
+      padding: 32px 8px;
+    }
+    @media (max-width: 780px) {
+      header { display: block; }
+      .controls { grid-template-columns: 1fr; }
+      .meta { grid-template-columns: 1fr 1fr; }
+      .card-head { display: block; }
+      .pill { margin-top: 8px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Keepalive Admin</h1>
+        <div class="subtitle">查看、停用或删除服务端保存的 Prompt Cache 快照。</div>
+      </div>
+      <button id="refreshTop" type="button">刷新</button>
+    </header>
+
+    <section class="panel">
+      <div class="controls">
+        <label>
+          服务地址
+          <input id="baseUrl" autocomplete="url" />
+        </label>
+        <label>
+          访问令牌
+          <input id="token" type="password" autocomplete="current-password" placeholder="KEEPALIVE_AUTH_TOKEN" />
+        </label>
+        <button id="refresh" class="primary" type="button">读取状态</button>
+      </div>
+      <div class="summary" id="summary"></div>
+      <div class="notice" id="notice"></div>
+    </section>
+
+    <section class="grid" id="conversations"></section>
+  </main>
+
+  <script>
+    const baseUrlInput = document.querySelector("#baseUrl");
+    const tokenInput = document.querySelector("#token");
+    const refreshButton = document.querySelector("#refresh");
+    const refreshTopButton = document.querySelector("#refreshTop");
+    const conversationsNode = document.querySelector("#conversations");
+    const summaryNode = document.querySelector("#summary");
+    const noticeNode = document.querySelector("#notice");
+
+    baseUrlInput.value = localStorage.getItem("ysclaude.keepalive.admin.baseUrl") || location.origin;
+    tokenInput.value = localStorage.getItem("ysclaude.keepalive.admin.token") || "";
+
+    function apiBase() {
+      return baseUrlInput.value.trim().replace(/\\/$/, "");
+    }
+
+    function authHeaders() {
+      const token = tokenInput.value.trim();
+      return token ? { Authorization: "Bearer " + token } : {};
+    }
+
+    function setNotice(message, isError = false) {
+      noticeNode.textContent = message || "";
+      noticeNode.classList.toggle("error", Boolean(isError));
+    }
+
+    function formatTime(value) {
+      if (!value) return "—";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "—";
+      return date.toLocaleString();
+    }
+
+    function shortHash(value) {
+      return value ? String(value).slice(0, 12) : "—";
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    async function requestJson(path, options = {}) {
+      const response = await fetch(apiBase() + path, {
+        ...options,
+        headers: {
+          ...authHeaders(),
+          ...(options.body ? { "Content-Type": "application/json" } : {}),
+          ...(options.headers || {}),
+        },
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(data?.error || "HTTP " + response.status);
+      }
+      return data;
+    }
+
+    function render(conversations) {
+      const activeCount = conversations.filter((item) => item.status === "active").length;
+      const pendingCount = conversations.reduce((sum, item) => sum + Number(item.pendingMessageCount || 0), 0);
+      const activityCount = conversations.reduce((sum, item) => sum + Number(item.activityCount || 0), 0);
+      summaryNode.innerHTML = [
+        "<span>会话 <strong>" + conversations.length + "</strong></span>",
+        "<span>活跃 <strong>" + activeCount + "</strong></span>",
+        "<span>待收件 <strong>" + pendingCount + "</strong></span>",
+        "<span>自主活动 <strong>" + activityCount + "</strong></span>",
+      ].join("");
+
+      if (conversations.length === 0) {
+        conversationsNode.innerHTML = '<div class="panel empty">暂无快照会话。</div>';
+        return;
+      }
+
+      conversationsNode.innerHTML = conversations.map((item) => {
+        const statusClass = item.status === "active" ? "active" : item.status === "disabled" ? "disabled" : "";
+        const preview = item.preview || {};
+        const tools = Array.isArray(item.agentToolsEnabled) && item.agentToolsEnabled.length
+          ? item.agentToolsEnabled.join(", ")
+          : "—";
+        return '<article class="card" data-id="' + escapeHtml(item.conversationId) + '">' +
+          '<div class="card-head">' +
+            '<div>' +
+              '<div class="field-name">Conversation</div>' +
+              '<div class="id">' + escapeHtml(item.conversationId) + '</div>' +
+            '</div>' +
+            '<span class="pill ' + statusClass + '">' + escapeHtml(item.status || "unknown") + '</span>' +
+          '</div>' +
+          '<div class="meta">' +
+            field("Hash", shortHash(item.snapshotHash)) +
+            field("Model", preview.model || "—") +
+            field("Messages", preview.messageCount ?? "—") +
+            field("Next", formatTime(item.nextKeepaliveAt)) +
+            field("Last touched", formatTime(item.lastTouchedAt)) +
+            field("Updated", formatTime(item.updatedAt)) +
+            field("Pending", item.pendingMessageCount || 0) +
+            field("Activity", item.activityCount || 0) +
+            field("Agent tick", item.agentTickEnabled ? "on" : "off") +
+            field("Push", item.pushConfigured ? "configured" : "—") +
+            field("Tools", tools) +
+            field("Disabled reason", item.disabledReason || "—") +
+          '</div>' +
+          '<div class="tail">' + escapeHtml((preview.lastMessageRole ? preview.lastMessageRole + ": " : "") + (preview.lastMessageTail || "暂无消息片段")) + '</div>' +
+          (item.lastError ? '<div class="notice error">保活失败：' + escapeHtml(item.lastError) + '</div>' : '') +
+          '<div class="actions">' +
+            '<button type="button" data-action="logs">查看日志</button>' +
+            '<button type="button" data-action="disable" ' + (item.status === "disabled" ? "disabled" : "") + '>停用</button>' +
+            '<button type="button" class="danger" data-action="delete">删除</button>' +
+          '</div>' +
+        '</article>';
+      }).join("");
+    }
+
+    function field(name, value) {
+      return '<div class="field"><div class="field-name">' + escapeHtml(name) + '</div><div class="field-value">' + escapeHtml(value) + '</div></div>';
+    }
+
+    async function refresh() {
+      refreshButton.disabled = true;
+      refreshTopButton.disabled = true;
+      setNotice("读取中...");
+      localStorage.setItem("ysclaude.keepalive.admin.baseUrl", apiBase());
+      localStorage.setItem("ysclaude.keepalive.admin.token", tokenInput.value.trim());
+      try {
+        const data = await requestJson("/v1/keepalive/status");
+        render(Array.isArray(data.conversations) ? data.conversations : []);
+        setNotice("已刷新 " + new Date().toLocaleTimeString());
+      } catch (error) {
+        setNotice(error.message || String(error), true);
+      } finally {
+        refreshButton.disabled = false;
+        refreshTopButton.disabled = false;
+      }
+    }
+
+    async function disableConversation(conversationId) {
+      if (!confirm("停用这个快照会话？\\n" + conversationId)) return;
+      await requestJson("/v1/keepalive/disable", {
+        method: "POST",
+        body: JSON.stringify({ conversationId, updatedAt: Date.now() }),
+      });
+      await refresh();
+    }
+
+    async function deleteConversation(conversationId) {
+      if (!confirm("永久删除这个快照会话？\\n删除后服务端不会再显示它，相关待收件和活动记录也会一起删除。\\n\\n" + conversationId)) return;
+      await requestJson("/v1/keepalive/conversations/" + encodeURIComponent(conversationId), {
+        method: "DELETE",
+      });
+      await refresh();
+    }
+
+    async function showLogs(conversationId) {
+      try {
+        const data = await requestJson("/v1/keepalive/logs?limit=40&conversationId=" + encodeURIComponent(conversationId));
+        const lines = (data.logs || []).map((entry) => {
+          return "[" + formatTime(entry.createdAt) + "] " + entry.type + " " + (entry.message || entry.error || "");
+        });
+        alert(lines.length ? lines.join("\\n") : "暂无日志");
+      } catch (error) {
+        setNotice(error.message || String(error), true);
+      }
+    }
+
+    conversationsNode.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-action]");
+      if (!button) return;
+      const card = button.closest("[data-id]");
+      const conversationId = card?.dataset.id;
+      if (!conversationId) return;
+      const action = button.dataset.action;
+      if (action === "disable") disableConversation(conversationId).catch((error) => setNotice(error.message || String(error), true));
+      if (action === "delete") deleteConversation(conversationId).catch((error) => setNotice(error.message || String(error), true));
+      if (action === "logs") showLogs(conversationId);
+    });
+
+    refreshButton.addEventListener("click", refresh);
+    refreshTopButton.addEventListener("click", refresh);
+    refresh();
+  </script>
+</body>
+</html>`;
 }
 
 async function handleAck(req, res, collectionName) {
@@ -1192,6 +1679,11 @@ async function handlePushToken(req, res) {
 async function route(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
+    if (req.method === 'GET' && (url.pathname === '/admin' || url.pathname === '/admin/')) {
+      htmlResponse(res, 200, adminPageHtml());
+      return;
+    }
+
     if (req.method === 'GET' && url.pathname === '/health') {
       jsonResponse(res, 200, {
         ok: true,
@@ -1248,6 +1740,15 @@ async function route(req, res) {
     }
     if (req.method === 'POST' && url.pathname === '/v1/keepalive/disable') {
       await handleDisable(req, res);
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/v1/keepalive/delete') {
+      await handleDeleteConversation(req, res);
+      return;
+    }
+    if (req.method === 'DELETE' && url.pathname.startsWith('/v1/keepalive/conversations/')) {
+      const conversationId = decodeURIComponent(url.pathname.slice('/v1/keepalive/conversations/'.length));
+      await handleDeleteConversation(req, res, conversationId);
       return;
     }
     if (req.method === 'POST' && url.pathname === '/v1/keepalive/push-token') {
