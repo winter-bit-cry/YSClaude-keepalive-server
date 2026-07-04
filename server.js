@@ -17,6 +17,9 @@ const SNAPSHOT_PREVIEW_TAIL_CHARS = 120;
 const AGENT_TICK_MAX_TOKENS = Number(process.env.AGENT_TICK_MAX_TOKENS || 800);
 const AGENT_ACTIVITY_MAX_TOOL_ROUNDS = Number(process.env.AGENT_ACTIVITY_MAX_TOOL_ROUNDS || 4);
 const SERVERCHAN_SENDKEY = process.env.SERVERCHAN_SENDKEY || '';
+const WXPUSHER_APP_TOKEN = process.env.WXPUSHER_APP_TOKEN || '';
+const WXPUSHER_UIDS = process.env.WXPUSHER_UIDS || '';
+const WXPUSHER_TOPIC_IDS = process.env.WXPUSHER_TOPIC_IDS || '';
 const PUSH_BODY_MAX_CHARS = 200;
 
 const state = {
@@ -256,7 +259,30 @@ function buildServerChanUrl(sendKey) {
 }
 
 function getServerChanSendKey(item) {
+  if (getPushProvider(item) === 'wxpusher') return '';
   return String(item?.push?.serverChanSendKey || SERVERCHAN_SENDKEY || '').trim();
+}
+
+function splitPushList(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+  return String(value || '')
+    .split(/[\s,，;；]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeTopicIds(value) {
+  return splitPushList(value)
+    .map((item) => Number(item))
+    .filter((item) => Number.isInteger(item) && item > 0);
+}
+
+function getPushProvider(item) {
+  const provider = String(item?.push?.provider || '').trim().toLowerCase();
+  if (provider === 'serverchan' || provider === 'wxpusher' || provider === 'both') return provider;
+  return 'both';
 }
 
 async function sendServerChanUserMessagePush(item, messageText) {
@@ -290,6 +316,75 @@ async function sendServerChanUserMessagePush(item, messageText) {
     throw new Error(`ServerChan error ${data.code}: ${data.message || text.slice(0, 300)}`);
   }
   return { sent: true };
+}
+
+function getWxPusherConfig(item) {
+  if (getPushProvider(item) === 'serverchan') return null;
+  const config = item?.push?.wxPusher || {};
+  const appToken = String(config.appToken || WXPUSHER_APP_TOKEN || '').trim();
+  const uids = splitPushList(config.uids || config.uid || WXPUSHER_UIDS);
+  const topicIds = normalizeTopicIds(config.topicIds || config.topicId || WXPUSHER_TOPIC_IDS);
+  if (!appToken) return null;
+  return { appToken, uids, topicIds };
+}
+
+async function sendWxPusherUserMessagePush(item, messageText) {
+  const config = getWxPusherConfig(item);
+  if (!config) return { sent: false, reason: 'no-app-token' };
+  if (config.uids.length === 0 && config.topicIds.length === 0) {
+    return { sent: false, reason: 'no-recipient' };
+  }
+
+  const content = String(messageText || '').trim().slice(0, PUSH_BODY_MAX_CHARS) || '（空消息）';
+  const response = await fetch('https://wxpusher.zjiecode.com/api/send/message', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json;charset=utf-8' },
+    body: JSON.stringify({
+      appToken: config.appToken,
+      content,
+      summary: 'Claude在呼叫你……',
+      contentType: 1,
+      uids: config.uids.length ? config.uids : undefined,
+      topicIds: config.topicIds.length ? config.topicIds : undefined,
+    }),
+  });
+  const text = await response.text().catch(() => '');
+  if (!response.ok) {
+    throw new Error(`WxPusher send ${response.status}: ${text.slice(0, 300)}`);
+  }
+  let data = null;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = null;
+  }
+  if (data && data.code !== 1000) {
+    return { sent: false, reason: data.msg || data.message || `code-${data.code}` };
+  }
+  return { sent: true };
+}
+
+async function sendUserMessagePushes(item, messageText) {
+  const senders = [];
+  if (getServerChanSendKey(item)) {
+    senders.push(['serverchan', () => sendServerChanUserMessagePush(item, messageText)]);
+  }
+  if (getWxPusherConfig(item)) {
+    senders.push(['wxpusher', () => sendWxPusherUserMessagePush(item, messageText)]);
+  }
+  if (senders.length === 0) {
+    return [{ channel: 'none', sent: false, reason: 'no-channel' }];
+  }
+
+  const results = [];
+  for (const [channel, sender] of senders) {
+    try {
+      results.push({ channel, ...(await sender()) });
+    } catch (error) {
+      results.push({ channel, sent: false, error: error.message || String(error) });
+    }
+  }
+  return results;
 }
 
 function getAgentToolDefinitions(agentTools = {}) {
@@ -780,6 +875,7 @@ async function runKeepalive(conversationId) {
         message: applyResult.message,
       });
       if (applyResult.logType === 'agent-user-message') {
+        if (getServerChanSendKey(item)) {
         // 推送失败不能中断保活周期
         try {
           const pushResult = await sendServerChanUserMessagePush(item, decision.message);
@@ -794,6 +890,25 @@ async function runKeepalive(conversationId) {
             error: error.message || String(error),
             message: error.message || String(error),
           });
+        }
+        }
+        if (getWxPusherConfig(item)) {
+          try {
+            const pushResult = await sendWxPusherUserMessagePush(item, decision.message);
+            addLog(pushResult.sent ? 'push-ok' : 'push-skipped', {
+              conversationId,
+              channel: 'wxpusher',
+              reason: pushResult.reason,
+              message: pushResult.sent ? 'wxpusher push sent' : `skipped: ${pushResult.reason}`,
+            });
+          } catch (error) {
+            addLog('push-error', {
+              conversationId,
+              channel: 'wxpusher',
+              error: error.message || String(error),
+              message: error.message || String(error),
+            });
+          }
         }
       }
     } else {
@@ -883,9 +998,26 @@ function normalizeAgentTick(agentTick) {
 
 function normalizePushConfig(push) {
   if (!push || typeof push !== 'object') return undefined;
+  const providerInput = String(push.provider || push.channel || '').trim().toLowerCase();
+  const provider = providerInput === 'serverchan' || providerInput === 'wxpusher' || providerInput === 'both'
+    ? providerInput
+    : 'both';
   const serverChanSendKey = typeof push.serverChanSendKey === 'string' ? push.serverChanSendKey.trim() : '';
-  if (!serverChanSendKey) return undefined;
-  return { serverChanSendKey };
+  const wxInput = push.wxPusher && typeof push.wxPusher === 'object' ? push.wxPusher : push;
+  const wxPusherAppToken = typeof wxInput.appToken === 'string' ? wxInput.appToken.trim() : '';
+  const wxPusherUids = splitPushList(wxInput.uids || wxInput.uid);
+  const wxPusherTopicIds = normalizeTopicIds(wxInput.topicIds || wxInput.topicId);
+  const normalized = {};
+  if ((provider === 'serverchan' || provider === 'both') && serverChanSendKey) normalized.serverChanSendKey = serverChanSendKey;
+  if ((provider === 'wxpusher' || provider === 'both') && wxPusherAppToken && (wxPusherUids.length > 0 || wxPusherTopicIds.length > 0)) {
+    normalized.wxPusher = {
+      appToken: wxPusherAppToken,
+      uids: wxPusherUids,
+      topicIds: wxPusherTopicIds,
+    };
+  }
+  if (Object.keys(normalized).length) normalized.provider = provider;
+  return Object.keys(normalized).length ? normalized : undefined;
 }
 
 function normalizeAgentTools(agentTools) {
@@ -1062,7 +1194,7 @@ function publicStatus() {
     preview: item.preview,
     agentToolsEnabled: getAgentToolDefinitions(item.agentTools).map((tool) => tool.function.name),
     agentTickEnabled: item.agentTick ? item.agentTick.enabled === true : getAgentToolDefinitions(item.agentTools).length > 0,
-    pushConfigured: Boolean(getServerChanSendKey(item)),
+    pushConfigured: Boolean(getServerChanSendKey(item) || getWxPusherConfig(item)),
     pendingMessageCount: (item.pendingMessages || []).filter((message) => !message.consumed).length,
     activityCount: (item.activityLog || []).filter((entry) => !entry.consumed).length,
   }));
@@ -1573,7 +1705,7 @@ async function handlePushToken(req, res) {
   const input = await readJsonBody(req);
   const push = normalizePushConfig(input.push || input);
   if (!push) {
-    jsonResponse(res, 400, { ok: false, error: 'serverChanSendKey is required' });
+    jsonResponse(res, 400, { ok: false, error: 'push channel config is required' });
     return;
   }
   // 单用户服务器：SendKey 更新时同步到所有会话
@@ -1594,6 +1726,22 @@ async function handlePushTest(req, res) {
   const input = await readJsonBody(req);
   const push = normalizePushConfig(input.push || input);
   const item = { push };
+  const results = await sendUserMessagePushes(item, input.message || 'YSClaude 推送测试：通知通道工作正常。');
+  const ok = results.some((result) => result.sent);
+  for (const result of results) {
+    addLog(result.sent ? 'push-test-ok' : result.error ? 'push-test-error' : 'push-test-skipped', {
+      channel: result.channel,
+      reason: result.reason,
+      error: result.error,
+      message: result.sent ? `${result.channel} test push sent` : result.error || `skipped: ${result.reason}`,
+    });
+  }
+  jsonResponse(res, ok ? 200 : 400, {
+    ok,
+    results,
+    error: ok ? undefined : results[0]?.error || results[0]?.reason,
+  });
+  return;
   try {
     const result = await sendServerChanUserMessagePush(item, input.message || 'YSClaude 推送测试：Server酱通道工作正常。');
     addLog(result.sent ? 'push-test-ok' : 'push-test-skipped', {
@@ -1701,6 +1849,9 @@ if (SERVERCHAN_SENDKEY) {
   console.log('[push] ServerChan fallback SendKey configured');
 } else {
   console.log('[push] no SERVERCHAN_SENDKEY env; push uses per-conversation SendKey from client');
+}
+if (WXPUSHER_APP_TOKEN) {
+  console.log('[push] WxPusher fallback AppToken configured');
 }
 for (const item of Object.values(state.conversations)) {
   if (item.status === 'active') {
