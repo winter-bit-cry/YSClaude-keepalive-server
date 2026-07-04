@@ -744,8 +744,21 @@ async function callChatCompletion(request, { messages, maxTokens, tools } = {}) 
   return response.json().catch(() => ({}));
 }
 
+function buildKeepaliveMessages(request) {
+  const messages = Array.isArray(request?.messages) ? request.messages : [];
+  const lastMessage = messages[messages.length - 1];
+  if (lastMessage?.role !== 'assistant') return messages;
+  return [
+    ...messages,
+    {
+      role: 'user',
+      content: '[Server keepalive ping] Keep the prompt cache warm. Do not answer this message.',
+    },
+  ];
+}
+
 async function callKeepaliveApi(request, maxTokens) {
-  return callChatCompletion(request, { maxTokens });
+  return callChatCompletion(request, { messages: buildKeepaliveMessages(request), maxTokens });
 }
 
 function buildAgentTickToolLines(item, tools) {
