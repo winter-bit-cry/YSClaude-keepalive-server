@@ -25,13 +25,12 @@
 KEEPALIVE_AUTH_TOKEN=换成你自己的长随机令牌
 KEEPALIVE_INTERVAL_MS=3300000
 
-# ntfy 直推，可选；App 也可以上报每个会话自己的 topic
-NTFY_SERVER_URL=https://ntfy.sh
-NTFY_TOPIC=
-NTFY_ACCESS_TOKEN=
 WXPUSHER_APP_TOKEN=
 WXPUSHER_UIDS=
 WXPUSHER_TOPIC_IDS=
+DINGTALK_WEBHOOK=
+DINGTALK_SECRET=
+DINGTALK_AT_MOBILES=
 YSCLAUDE_APP_DEEPLINK_BASE=ysclaude://chat/
 ```
 
@@ -176,6 +175,15 @@ This model does not support assistant message prefill.
 - 可使用 `WXPUSHER_APP_TOKEN`、`WXPUSHER_UIDS`、`WXPUSHER_TOPIC_IDS` 作为服务端兜底配置。
 - App 也可以上报每个会话自己的 WxPusher AppToken、UID 或 Topic ID。
 - 适合一加等严格杀后台机型作为稳定兜底；通知来自 WxPusher/微信，点击可通过 deep link 回到 YSClaude。
+
+## 当前推送通道
+
+当前版本只保留两个远程推送通道，二选一：
+
+- `dingtalk`：钉钉群自定义机器人 Webhook。可配置 `DINGTALK_WEBHOOK`、`DINGTALK_SECRET`、`DINGTALK_AT_MOBILES` 作为服务端兜底，也可由 App 上报每个会话自己的配置。
+- `wxpusher`：WxPusher AppToken + UID/Topic ID。可配置 `WXPUSHER_APP_TOKEN`、`WXPUSHER_UIDS`、`WXPUSHER_TOPIC_IDS` 作为服务端兜底，也可由 App 上报。
+
+服务端会忽略旧的 `ntfy`、`unifiedpush`、`all/both` 推送配置；App 设置页也不再显示这些通道。
 
 ## 接口
 

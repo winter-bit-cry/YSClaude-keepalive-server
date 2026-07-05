@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { createCipheriv, createECDH, createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,12 +16,12 @@ const MAX_LOG_ENTRIES = Number(process.env.MAX_LOG_ENTRIES || 300);
 const SNAPSHOT_PREVIEW_TAIL_CHARS = 120;
 const AGENT_TICK_MAX_TOKENS = Number(process.env.AGENT_TICK_MAX_TOKENS || 800);
 const AGENT_ACTIVITY_MAX_TOOL_ROUNDS = Number(process.env.AGENT_ACTIVITY_MAX_TOOL_ROUNDS || 4);
-const NTFY_SERVER_URL = process.env.NTFY_SERVER_URL || 'https://ntfy.sh';
-const NTFY_TOPIC = process.env.NTFY_TOPIC || '';
-const NTFY_ACCESS_TOKEN = process.env.NTFY_ACCESS_TOKEN || '';
 const WXPUSHER_APP_TOKEN = process.env.WXPUSHER_APP_TOKEN || '';
 const WXPUSHER_UIDS = process.env.WXPUSHER_UIDS || '';
 const WXPUSHER_TOPIC_IDS = process.env.WXPUSHER_TOPIC_IDS || '';
+const DINGTALK_WEBHOOK = process.env.DINGTALK_WEBHOOK || '';
+const DINGTALK_SECRET = process.env.DINGTALK_SECRET || '';
+const DINGTALK_AT_MOBILES = process.env.DINGTALK_AT_MOBILES || '';
 const YSCLAUDE_APP_DEEPLINK_BASE = process.env.YSCLAUDE_APP_DEEPLINK_BASE || 'ysclaude://chat/';
 const PUSH_BODY_MAX_CHARS = 200;
 
@@ -392,18 +392,17 @@ function shouldRetryWithOneToken(error) {
   return text.includes('max_tokens') || text.includes('max tokens') || text.includes('greater than 0');
 }
 
-const PUSH_PROVIDERS = ['ntfy', 'unifiedpush', 'wxpusher'];
+const PUSH_PROVIDERS = ['wxpusher', 'dingtalk'];
 
 function getPushProvider(item) {
   const provider = String(item?.push?.provider || '').trim().toLowerCase();
-  if (PUSH_PROVIDERS.includes(provider) || provider === 'both' || provider === 'all') return provider;
-  return 'all';
+  if (PUSH_PROVIDERS.includes(provider)) return provider;
+  return 'dingtalk';
 }
 
-// both（历史值）与 all 均表示"所有已配置的通道"
 function isProviderEnabled(item, channel) {
   const provider = getPushProvider(item);
-  return provider === channel || provider === 'both' || provider === 'all';
+  return provider === channel;
 }
 
 function buildConversationDeepLink(conversationId) {
@@ -432,43 +431,6 @@ function normalizeTopicIds(value) {
   return splitPushList(value)
     .map((item) => Number.parseInt(item, 10))
     .filter((item) => Number.isFinite(item) && item > 0);
-}
-
-function getNtfyConfig(item) {
-  if (!isProviderEnabled(item, 'ntfy')) return null;
-  const config = item?.push?.ntfy || {};
-  const serverUrl = String(config.serverUrl || NTFY_SERVER_URL || 'https://ntfy.sh').trim().replace(/\/+$/, '');
-  const topic = String(config.topic || NTFY_TOPIC || '').trim();
-  const accessToken = String(config.accessToken || NTFY_ACCESS_TOKEN || '').trim();
-  if (!topic) return null;
-  return { serverUrl, topic, accessToken };
-}
-
-// ntfy 的 HTTP header 不接受非 ASCII，中文标题必须走 JSON 发布端点（POST 根路径）
-async function sendNtfyUserMessagePush(item, messageText) {
-  const config = getNtfyConfig(item);
-  if (!config) return { sent: false, reason: 'no-topic' };
-
-  const message = String(messageText || '').trim().slice(0, PUSH_BODY_MAX_CHARS) || '（空消息）';
-  const click = buildConversationDeepLink(item?.conversationId);
-  const headers = { 'Content-Type': 'application/json;charset=utf-8' };
-  if (config.accessToken) headers.Authorization = `Bearer ${config.accessToken}`;
-  const response = await fetch(`${config.serverUrl}/`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      topic: config.topic,
-      title: 'Claude在呼叫你……',
-      message,
-      click,
-      priority: 4,
-    }),
-  });
-  const text = await response.text().catch(() => '');
-  if (!response.ok) {
-    throw new Error(`Ntfy send ${response.status}: ${text.slice(0, 300)}`);
-  }
-  return { sent: true };
 }
 
 function getWxPusherConfig(item) {
@@ -512,132 +474,64 @@ async function sendWxPusherUserMessagePush(item, messageText) {
   return { sent: true };
 }
 
-function base64urlDecode(value) {
-  const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
-  const padding = '='.repeat((4 - (normalized.length % 4)) % 4);
-  return Buffer.from(normalized + padding, 'base64');
+function getDingTalkConfig(item) {
+  if (!isProviderEnabled(item, 'dingtalk')) return null;
+  const config = item?.push?.dingTalk || item?.push?.dingtalk || {};
+  const webhook = String(config.webhook || DINGTALK_WEBHOOK || '').trim();
+  const secret = String(config.secret || DINGTALK_SECRET || '').trim();
+  const atMobiles = splitPushList(config.atMobiles || config.atMobile || DINGTALK_AT_MOBILES);
+  if (!webhook) return null;
+  return { webhook, secret, atMobiles };
 }
 
-function base64urlEncode(buffer) {
-  return Buffer.from(buffer).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-function hkdfExtract(salt, ikm) {
-  return createHmac('sha256', salt).update(ikm).digest();
-}
-
-function hkdfExpand(prk, info, length) {
-  const blocks = [];
-  let previous = Buffer.alloc(0);
-  let counter = 1;
-  while (Buffer.concat(blocks).length < length) {
-    previous = createHmac('sha256', prk)
-      .update(previous)
-      .update(info)
-      .update(Buffer.from([counter++]))
-      .digest();
-    blocks.push(previous);
+function buildDingTalkWebhookUrl(webhook, secret) {
+  const url = new URL(webhook);
+  if (secret) {
+    const timestamp = String(Date.now());
+    const sign = createHmac('sha256', secret)
+      .update(`${timestamp}\n${secret}`)
+      .digest('base64');
+    url.searchParams.set('timestamp', timestamp);
+    url.searchParams.set('sign', sign);
   }
-  return Buffer.concat(blocks).subarray(0, length);
+  return url.toString();
 }
 
-function encryptWebPush(payloadBuffer, p256dhBase64url, authBase64url, options = {}) {
-  const receiverPublicKey = base64urlDecode(p256dhBase64url);
-  const authSecret = base64urlDecode(authBase64url);
-  if (receiverPublicKey.length !== 65 || receiverPublicKey[0] !== 0x04) {
-    throw new Error('UnifiedPush p256dh must be an uncompressed P-256 public key');
-  }
-  if (authSecret.length === 0) {
-    throw new Error('UnifiedPush auth secret is required');
-  }
+async function sendDingTalkUserMessagePush(item, messageText) {
+  const config = getDingTalkConfig(item);
+  if (!config) return { sent: false, reason: 'no-dingtalk-webhook' };
 
-  const ecdh = createECDH('prime256v1');
-  if (options.senderPrivateKey) {
-    ecdh.setPrivateKey(options.senderPrivateKey);
-  } else {
-    ecdh.generateKeys();
-  }
-  const senderPublicKey = options.senderPublicKey || ecdh.getPublicKey();
-  const salt = options.salt || randomBytes(16);
-  const recordSize = options.recordSize || 4096;
-  const sharedSecret = ecdh.computeSecret(receiverPublicKey);
-
-  const keyInfo = Buffer.concat([
-    Buffer.from('WebPush: info\0', 'utf8'),
-    receiverPublicKey,
-    senderPublicKey,
-  ]);
-  const keyPrk = hkdfExtract(authSecret, sharedSecret);
-  const ikm = hkdfExpand(keyPrk, keyInfo, 32);
-  const contentPrk = hkdfExtract(salt, ikm);
-  const cek = hkdfExpand(contentPrk, Buffer.from('Content-Encoding: aes128gcm\0', 'utf8'), 16);
-  const nonce = hkdfExpand(contentPrk, Buffer.from('Content-Encoding: nonce\0', 'utf8'), 12);
-  const record = Buffer.concat([Buffer.from(payloadBuffer), Buffer.from([0x02])]);
-  const cipher = createCipheriv('aes-128-gcm', cek, nonce);
-  const ciphertext = Buffer.concat([cipher.update(record), cipher.final(), cipher.getAuthTag()]);
-  const rs = Buffer.alloc(4);
-  rs.writeUInt32BE(recordSize, 0);
-  const header = Buffer.concat([salt, rs, Buffer.from([senderPublicKey.length]), senderPublicKey]);
-  return Buffer.concat([header, ciphertext]);
-}
-
-function runWebPushSelfTest() {
-  const plaintext = base64urlDecode('V2hlbiBJIGdyb3cgdXAsIEkgd2FudCB0byBiZSBhIHdhdGVybWVsb24');
-  const uaPublic = 'BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4';
-  const auth = 'BTBZMqHH6r4Tts7J_aSIgg';
-  const senderPrivateKey = base64urlDecode('yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw');
-  const salt = base64urlDecode('DGv6ra1nlYgDCS1FRnbzlw');
-  const expected = [
-    'DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27ml',
-    'mlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPT',
-    'pK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN',
-  ].join('');
-  const encrypted = encryptWebPush(plaintext, uaPublic, auth, { senderPrivateKey, salt });
-  const actual = base64urlEncode(encrypted);
-  if (actual !== expected) {
-    throw new Error('RFC 8291 test vector mismatch');
-  }
-}
-
-function getUnifiedPushConfig(item) {
-  if (!isProviderEnabled(item, 'unifiedpush')) return null;
-  const config = item?.push?.unifiedpush || item?.push?.unifiedPush || {};
-  const endpoint = String(config.endpoint || '').trim();
-  const p256dh = String(config.p256dh || '').trim();
-  const auth = String(config.auth || '').trim();
-  if (!endpoint || !p256dh || !auth) return null;
-  return { endpoint, p256dh, auth };
-}
-
-async function sendUnifiedPushUserMessagePush(item, messageText) {
-  const config = getUnifiedPushConfig(item);
-  if (!config) return { sent: false, reason: 'no-endpoint' };
   const message = String(messageText || '').trim().slice(0, PUSH_BODY_MAX_CHARS) || '（空消息）';
-  const payload = Buffer.from(JSON.stringify({
-    conversationId: item?.conversationId || '',
+  const link = buildConversationDeepLink(item?.conversationId);
+  const text = [
+    '### YSClaude',
+    '',
     message,
-  }), 'utf8');
-  const body = encryptWebPush(payload, config.p256dh, config.auth);
-  const response = await fetch(config.endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Encoding': 'aes128gcm',
-      TTL: '86400',
-      Urgency: 'high',
-      'Content-Type': 'application/octet-stream',
+    link ? `\n[打开 YSClaude](${link})` : '',
+  ].filter(Boolean).join('\n');
+  const body = {
+    msgtype: 'markdown',
+    markdown: {
+      title: 'YSClaude',
+      text,
     },
-    body,
+    at: {
+      atMobiles: config.atMobiles,
+      isAtAll: false,
+    },
+  };
+  const response = await fetch(buildDingTalkWebhookUrl(config.webhook, config.secret), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json;charset=utf-8' },
+    body: JSON.stringify(body),
   });
-  const text = await response.text().catch(() => '');
-  if (response.status === 404 || response.status === 410) {
-    if (item?.push?.unifiedpush) {
-      delete item.push.unifiedpush;
-      await saveState().catch(() => undefined);
-    }
-    return { sent: false, reason: 'endpoint-gone' };
-  }
+  const raw = await response.text().catch(() => '');
   if (!response.ok) {
-    throw new Error(`UnifiedPush send ${response.status}: ${text.slice(0, 300)}`);
+    throw new Error(`DingTalk send ${response.status}: ${raw.slice(0, 300)}`);
+  }
+  const data = raw ? JSON.parse(raw) : null;
+  if (data && data.errcode !== 0) {
+    return { sent: false, reason: data.errmsg || `dingtalk-errcode-${data.errcode}` };
   }
   return { sent: true };
 }
@@ -647,11 +541,8 @@ async function sendUserMessagePushes(item, messageText) {
   if (getWxPusherConfig(item)) {
     senders.push(['wxpusher', () => sendWxPusherUserMessagePush(item, messageText)]);
   }
-  if (getNtfyConfig(item)) {
-    senders.push(['ntfy', () => sendNtfyUserMessagePush(item, messageText)]);
-  }
-  if (getUnifiedPushConfig(item)) {
-    senders.push(['unifiedpush', () => sendUnifiedPushUserMessagePush(item, messageText)]);
+  if (getDingTalkConfig(item)) {
+    senders.push(['dingtalk', () => sendDingTalkUserMessagePush(item, messageText)]);
   }
   if (senders.length === 0) {
     return [{ channel: 'none', sent: false, reason: 'no-channel' }];
@@ -1285,13 +1176,9 @@ function normalizeAgentTick(agentTick) {
 function normalizePushConfig(push) {
   if (!push || typeof push !== 'object') return undefined;
   const providerInput = String(push.provider || push.channel || '').trim().toLowerCase();
-  const provider = PUSH_PROVIDERS.includes(providerInput) || providerInput === 'both' || providerInput === 'all'
+  const provider = PUSH_PROVIDERS.includes(providerInput)
     ? providerInput
-    : 'all';
-  const ntfyInput = push.ntfy && typeof push.ntfy === 'object' ? push.ntfy : null;
-  const ntfyServerUrl = typeof ntfyInput?.serverUrl === 'string' ? ntfyInput.serverUrl.trim().replace(/\/+$/, '') : '';
-  const ntfyTopic = typeof ntfyInput?.topic === 'string' ? ntfyInput.topic.trim() : '';
-  const ntfyAccessToken = typeof ntfyInput?.accessToken === 'string' ? ntfyInput.accessToken.trim() : '';
+    : 'dingtalk';
   const wxInput = push.wxPusher && typeof push.wxPusher === 'object'
     ? push.wxPusher
     : push.wxpusher && typeof push.wxpusher === 'object'
@@ -1300,42 +1187,34 @@ function normalizePushConfig(push) {
   const wxAppToken = typeof wxInput?.appToken === 'string' ? wxInput.appToken.trim() : '';
   const wxUids = splitPushList(wxInput?.uids || wxInput?.uid);
   const wxTopicIds = normalizeTopicIds(wxInput?.topicIds || wxInput?.topicId);
-  const upInput = push.unifiedpush && typeof push.unifiedpush === 'object'
-    ? push.unifiedpush
-    : push.unifiedPush && typeof push.unifiedPush === 'object'
-      ? push.unifiedPush
+  const dingInput = push.dingTalk && typeof push.dingTalk === 'object'
+    ? push.dingTalk
+    : push.dingtalk && typeof push.dingtalk === 'object'
+      ? push.dingtalk
       : null;
-  const upEndpoint = typeof upInput?.endpoint === 'string' ? upInput.endpoint.trim() : '';
-  const upP256dh = typeof upInput?.p256dh === 'string' ? upInput.p256dh.trim() : '';
-  const upAuth = typeof upInput?.auth === 'string' ? upInput.auth.trim() : '';
-  const allowAll = provider === 'both' || provider === 'all';
+  const dingWebhook = typeof dingInput?.webhook === 'string' ? dingInput.webhook.trim() : '';
+  const dingSecret = typeof dingInput?.secret === 'string' ? dingInput.secret.trim() : '';
+  const dingAtMobiles = splitPushList(dingInput?.atMobiles || dingInput?.atMobile);
   const normalized = {};
-  if ((provider === 'ntfy' || allowAll) && ntfyTopic) {
-    normalized.ntfy = {
-      serverUrl: ntfyServerUrl,
-      topic: ntfyTopic,
-      accessToken: ntfyAccessToken,
-    };
-  }
-  if ((provider === 'wxpusher' || allowAll) && wxAppToken && (wxUids.length > 0 || wxTopicIds.length > 0)) {
+  if (provider === 'wxpusher' && wxAppToken && (wxUids.length > 0 || wxTopicIds.length > 0)) {
     normalized.wxPusher = {
       appToken: wxAppToken,
       uids: wxUids,
       topicIds: wxTopicIds,
     };
   }
-  if ((provider === 'unifiedpush' || allowAll) && upEndpoint && upP256dh && upAuth) {
-    let endpointUrl = null;
+  if (provider === 'dingtalk' && dingWebhook) {
+    let webhookUrl = null;
     try {
-      endpointUrl = new URL(upEndpoint);
+      webhookUrl = new URL(dingWebhook);
     } catch {
-      endpointUrl = null;
+      webhookUrl = null;
     }
-    if (endpointUrl?.protocol === 'https:') {
-      normalized.unifiedpush = {
-        endpoint: upEndpoint,
-        p256dh: upP256dh,
-        auth: upAuth,
+    if (webhookUrl?.protocol === 'https:') {
+      normalized.dingTalk = {
+        webhook: dingWebhook,
+        secret: dingSecret,
+        atMobiles: dingAtMobiles,
       };
     }
   }
@@ -1510,7 +1389,7 @@ function publicStatus() {
     preview: item.preview,
     agentToolsEnabled: getAgentToolDefinitions(item.agentTools).map((tool) => tool.function.name),
     agentTickEnabled: item.agentTick ? item.agentTick.enabled === true : getAgentToolDefinitions(item.agentTools).length > 0,
-    pushConfigured: Boolean(getNtfyConfig(item) || getUnifiedPushConfig(item) || getWxPusherConfig(item)),
+    pushConfigured: Boolean(getWxPusherConfig(item) || getDingTalkConfig(item)),
     pendingMessageCount: (item.pendingMessages || []).filter((message) => !message.consumed).length,
     activityCount: (item.activityLog || []).filter((entry) => !entry.consumed).length,
   }));
@@ -2152,15 +2031,9 @@ async function route(req, res) {
 }
 
 await loadState();
-try {
-  runWebPushSelfTest();
-  console.log('[webpush] self-test ok');
-} catch (error) {
-  console.error('[webpush] self-test failed:', error.message || String(error));
-}
 console.log(`[push] providers enabled: ${PUSH_PROVIDERS.join(', ')}`);
-console.log(NTFY_TOPIC ? '[push] ntfy fallback topic configured' : '[push] ntfy uses per-conversation topic from client');
 console.log(WXPUSHER_APP_TOKEN ? '[push] WxPusher fallback AppToken configured' : '[push] WxPusher uses per-conversation config from client');
+console.log(DINGTALK_WEBHOOK ? '[push] DingTalk fallback webhook configured' : '[push] DingTalk uses per-conversation config from client');
 for (const item of Object.values(state.conversations)) {
   if (item.status === 'active') {
     scheduleConversation(item.conversationId);
