@@ -2,14 +2,14 @@
 
 轻量自托管的 YSClaude 远程 Prompt Cache 保活与 AI 定时唤醒服务。
 
-它接收 YSClaude App 上传的最后一次成功使用 `1h` Prompt Cache 的请求快照，保存到服务端，并在 App 离线时继续维持缓存、执行远程 AI 自主 tick、发送微信推送，并在用户点击 WxPusher 消息后打开 App 对应对话。
+它接收 YSClaude App 上传的最后一次成功使用 `1h` Prompt Cache 的请求快照，保存到服务端，并在 App 离线时继续维持缓存、执行远程 AI 自主 tick，通过 ntfy 或 UnifiedPush 发送提醒，并让 App 下次启动/前台时同步远程收件箱。
 
 ## 功能
 
 - 远程保活：按 `KEEPALIVE_INTERVAL_MS` 保持 `1h` Prompt Cache，默认 55 分钟。
 - AI 自主唤醒：AI 每次被唤醒时必须返回 `next_awake`，服务端据此安排下一次 AI tick。
 - 长间隔补保活：如果 `next_awake` 距当前时间超过 55 分钟，服务端会先做普通保活，到点后再唤醒 AI。
-- 点击推送打开对话：WxPusher 推送带 `ysclaude://chat/{conversationId}` deep link，点击后打开 YSClaude App 对应对话。
+- 推送提醒：支持 ntfy 直推和 Android UnifiedPush。UnifiedPush 正文使用 WebPush `aes128gcm` 端到端加密，通知由 YSClaude App 自身弹出。
 - 远程收件箱：AI 主动留言写入 `pendingMessages`，App 下次启动或打开对话时同步。
 - 远程活动日志：AI 内部活动写入 `activityLog`，可由 App 同步。
 - 勿扰清空：每天进入勿扰时间后，服务端会清空所有快照、保活 timer、日志和待收件数据。
@@ -25,13 +25,10 @@
 KEEPALIVE_AUTH_TOKEN=换成你自己的长随机令牌
 KEEPALIVE_INTERVAL_MS=3300000
 
-# Server酱，可选
-SERVERCHAN_SENDKEY=
-
-# WxPusher，可选但推荐，用于点击消息打开 App
-WXPUSHER_APP_TOKEN=AT_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-WXPUSHER_UIDS=UID_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-WXPUSHER_TOPIC_IDS=
+# ntfy 直推，可选；App 也可以上报每个会话自己的 topic
+NTFY_SERVER_URL=https://ntfy.sh
+NTFY_TOPIC=
+NTFY_ACCESS_TOKEN=
 YSCLAUDE_APP_DEEPLINK_BASE=ysclaude://chat/
 ```
 
@@ -59,15 +56,14 @@ https://你的-zeabur-域名/admin
 
 - 服务地址：`https://你的-zeabur-域名`
 - 访问令牌：`KEEPALIVE_AUTH_TOKEN`
-- 推送通道：Server酱、WxPusher 或 both
+- 推送通道：Ntfy、UnifiedPush 或全部
 
 ## 本地启动
 
 ```powershell
 cd E:\Desktop\YSClaude-project\YSClaude-keepalive-server
 $env:KEEPALIVE_AUTH_TOKEN="换成你自己的长随机令牌"
-$env:WXPUSHER_APP_TOKEN="AT_xxx"
-$env:WXPUSHER_UIDS="UID_xxx"
+$env:NTFY_TOPIC="ysclaude-随机长字符串"
 npm.cmd start
 ```
 
@@ -117,20 +113,19 @@ AI 返回示例：
 
 ## 推送
 
-支持 Server酱和 WxPusher。
+支持 ntfy 和 UnifiedPush。
 
-Server酱：
+ntfy：
 
-- 支持经典版 `SCT...`，走 `sctapi.ftqq.com`。
-- 支持 Server酱³ `sctp{uid}t...`，走 `push.ft07.com`。
-- SendKey 优先使用 App 快照上报配置，没有时使用环境变量 `SERVERCHAN_SENDKEY`。
+- 可使用 `NTFY_SERVER_URL`、`NTFY_TOPIC`、`NTFY_ACCESS_TOKEN` 作为服务端兜底配置。
+- App 也会在快照/推送配置中上报每个会话的 ntfy 配置，优先使用 App 上报值。
+- 这是直接推送到 ntfy App 的回退通道。
 
-WxPusher：
+UnifiedPush：
 
-- 使用 `WXPUSHER_APP_TOKEN`、`WXPUSHER_UIDS`、`WXPUSHER_TOPIC_IDS`。
-- AI 给用户留言时，服务端发送 WxPusher 消息。
-- 推送 payload 会带 `url`，默认是 `ysclaude://chat/{conversationId}`。
-- 点击消息后，Android 会打开 YSClaude App 并跳转到对应会话。
+- App 注册后会上报 `{ endpoint, p256dh, auth }`。
+- 服务端按 RFC 8291 WebPush `aes128gcm` 加密 `{ conversationId, message }` 后 POST 到 endpoint。
+- ntfy 等 UnifiedPush 分发器只负责后台分发，明文只在手机端由 YSClaude 解出并弹出原生通知。
 - `YSCLAUDE_APP_DEEPLINK_BASE` 可改为自定义格式，支持 `{conversationId}` 占位，例如：
 
 ```text

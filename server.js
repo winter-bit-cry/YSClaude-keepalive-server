@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { createHash, randomUUID } from 'node:crypto';
+import { createCipheriv, createECDH, createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,10 +16,9 @@ const MAX_LOG_ENTRIES = Number(process.env.MAX_LOG_ENTRIES || 300);
 const SNAPSHOT_PREVIEW_TAIL_CHARS = 120;
 const AGENT_TICK_MAX_TOKENS = Number(process.env.AGENT_TICK_MAX_TOKENS || 800);
 const AGENT_ACTIVITY_MAX_TOOL_ROUNDS = Number(process.env.AGENT_ACTIVITY_MAX_TOOL_ROUNDS || 4);
-const SERVERCHAN_SENDKEY = process.env.SERVERCHAN_SENDKEY || '';
-const WXPUSHER_APP_TOKEN = process.env.WXPUSHER_APP_TOKEN || '';
-const WXPUSHER_UIDS = process.env.WXPUSHER_UIDS || '';
-const WXPUSHER_TOPIC_IDS = process.env.WXPUSHER_TOPIC_IDS || '';
+const NTFY_SERVER_URL = process.env.NTFY_SERVER_URL || 'https://ntfy.sh';
+const NTFY_TOPIC = process.env.NTFY_TOPIC || '';
+const NTFY_ACCESS_TOKEN = process.env.NTFY_ACCESS_TOKEN || '';
 const YSCLAUDE_APP_DEEPLINK_BASE = process.env.YSCLAUDE_APP_DEEPLINK_BASE || 'ysclaude://chat/';
 const PUSH_BODY_MAX_CHARS = 200;
 
@@ -390,86 +389,18 @@ function shouldRetryWithOneToken(error) {
   return text.includes('max_tokens') || text.includes('max tokens') || text.includes('greater than 0');
 }
 
-// ─── Server酱推送 ────────────────────────────────────────────
-// 兼容两代 SendKey：SCT 开头走 sctapi.ftqq.com；sctp{uid}t 开头走 Server酱3 的 push.ft07.com。
-function buildServerChanUrl(sendKey) {
-  const key = String(sendKey || '').trim();
-  if (!key) return null;
-  const sc3Match = key.match(/^sctp(\d+)t/i);
-  if (sc3Match) {
-    return `https://${sc3Match[1]}.push.ft07.com/send/${key}.send`;
-  }
-  return `https://sctapi.ftqq.com/${key}.send`;
-}
-
-function getServerChanSendKey(item) {
-  if (getPushProvider(item) === 'wxpusher') return '';
-  return String(item?.push?.serverChanSendKey || SERVERCHAN_SENDKEY || '').trim();
-}
-
-function splitPushList(value) {
-  if (Array.isArray(value)) {
-    return value.map((item) => String(item || '').trim()).filter(Boolean);
-  }
-  return String(value || '')
-    .split(/[\s,，;；]+/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function normalizeTopicIds(value) {
-  return splitPushList(value)
-    .map((item) => Number(item))
-    .filter((item) => Number.isInteger(item) && item > 0);
-}
+const PUSH_PROVIDERS = ['ntfy', 'unifiedpush'];
 
 function getPushProvider(item) {
   const provider = String(item?.push?.provider || '').trim().toLowerCase();
-  if (provider === 'serverchan' || provider === 'wxpusher' || provider === 'both') return provider;
-  return 'both';
+  if (PUSH_PROVIDERS.includes(provider) || provider === 'both' || provider === 'all') return provider;
+  return 'all';
 }
 
-async function sendServerChanUserMessagePush(item, messageText) {
-  const sendKey = getServerChanSendKey(item);
-  if (!sendKey) return { sent: false, reason: 'no-sendkey' };
-  const url = buildServerChanUrl(sendKey);
-  if (!url) return { sent: false, reason: 'invalid-sendkey' };
-
-  const desp = String(messageText || '').trim().slice(0, PUSH_BODY_MAX_CHARS);
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json;charset=utf-8' },
-    body: JSON.stringify({
-      title: 'Claude在呼叫你……',
-      desp: desp || '（空消息）',
-      short: desp || undefined,
-    }),
-  });
-  const text = await response.text().catch(() => '');
-  if (!response.ok) {
-    throw new Error(`ServerChan send ${response.status}: ${text.slice(0, 300)}`);
-  }
-  let data = null;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    // 非 JSON 响应但 HTTP 成功，按成功处理
-  }
-  if (data && typeof data.code === 'number' && data.code !== 0) {
-    // code 非 0 通常是 SendKey 错误或超出配额
-    throw new Error(`ServerChan error ${data.code}: ${data.message || text.slice(0, 300)}`);
-  }
-  return { sent: true };
-}
-
-function getWxPusherConfig(item) {
-  if (getPushProvider(item) === 'serverchan') return null;
-  const config = item?.push?.wxPusher || {};
-  const appToken = String(config.appToken || WXPUSHER_APP_TOKEN || '').trim();
-  const uids = splitPushList(config.uids || config.uid || WXPUSHER_UIDS);
-  const topicIds = normalizeTopicIds(config.topicIds || config.topicId || WXPUSHER_TOPIC_IDS);
-  if (!appToken) return null;
-  return { appToken, uids, topicIds };
+// both（历史值）与 all 均表示"所有已配置的通道"
+function isProviderEnabled(item, channel) {
+  const provider = getPushProvider(item);
+  return provider === channel || provider === 'both' || provider === 'all';
 }
 
 function buildConversationDeepLink(conversationId) {
@@ -482,51 +413,180 @@ function buildConversationDeepLink(conversationId) {
   return `${base.replace(/\/?$/, '/')}${encodedId}`;
 }
 
-async function sendWxPusherUserMessagePush(item, messageText) {
-  const config = getWxPusherConfig(item);
-  if (!config) return { sent: false, reason: 'no-app-token' };
-  if (config.uids.length === 0 && config.topicIds.length === 0) {
-    return { sent: false, reason: 'no-recipient' };
-  }
+function getNtfyConfig(item) {
+  if (!isProviderEnabled(item, 'ntfy')) return null;
+  const config = item?.push?.ntfy || {};
+  const serverUrl = String(config.serverUrl || NTFY_SERVER_URL || 'https://ntfy.sh').trim().replace(/\/+$/, '');
+  const topic = String(config.topic || NTFY_TOPIC || '').trim();
+  const accessToken = String(config.accessToken || NTFY_ACCESS_TOKEN || '').trim();
+  if (!topic) return null;
+  return { serverUrl, topic, accessToken };
+}
 
-  const content = String(messageText || '').trim().slice(0, PUSH_BODY_MAX_CHARS) || '（空消息）';
-  const url = buildConversationDeepLink(item?.conversationId);
-  const response = await fetch('https://wxpusher.zjiecode.com/api/send/message', {
+// ntfy 的 HTTP header 不接受非 ASCII，中文标题必须走 JSON 发布端点（POST 根路径）
+async function sendNtfyUserMessagePush(item, messageText) {
+  const config = getNtfyConfig(item);
+  if (!config) return { sent: false, reason: 'no-topic' };
+
+  const message = String(messageText || '').trim().slice(0, PUSH_BODY_MAX_CHARS) || '（空消息）';
+  const click = buildConversationDeepLink(item?.conversationId);
+  const headers = { 'Content-Type': 'application/json;charset=utf-8' };
+  if (config.accessToken) headers.Authorization = `Bearer ${config.accessToken}`;
+  const response = await fetch(`${config.serverUrl}/`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json;charset=utf-8' },
+    headers,
     body: JSON.stringify({
-      appToken: config.appToken,
-      content,
-      summary: 'Claude在呼叫你……',
-      contentType: 1,
-      url,
-      uids: config.uids.length ? config.uids : undefined,
-      topicIds: config.topicIds.length ? config.topicIds : undefined,
+      topic: config.topic,
+      title: 'Claude在呼叫你……',
+      message,
+      click,
+      priority: 4,
     }),
   });
   const text = await response.text().catch(() => '');
   if (!response.ok) {
-    throw new Error(`WxPusher send ${response.status}: ${text.slice(0, 300)}`);
+    throw new Error(`Ntfy send ${response.status}: ${text.slice(0, 300)}`);
   }
-  let data = null;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = null;
+  return { sent: true };
+}
+
+function base64urlDecode(value) {
+  const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+  const padding = '='.repeat((4 - (normalized.length % 4)) % 4);
+  return Buffer.from(normalized + padding, 'base64');
+}
+
+function base64urlEncode(buffer) {
+  return Buffer.from(buffer).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function hkdfExtract(salt, ikm) {
+  return createHmac('sha256', salt).update(ikm).digest();
+}
+
+function hkdfExpand(prk, info, length) {
+  const blocks = [];
+  let previous = Buffer.alloc(0);
+  let counter = 1;
+  while (Buffer.concat(blocks).length < length) {
+    previous = createHmac('sha256', prk)
+      .update(previous)
+      .update(info)
+      .update(Buffer.from([counter++]))
+      .digest();
+    blocks.push(previous);
   }
-  if (data && data.code !== 1000) {
-    return { sent: false, reason: data.msg || data.message || `code-${data.code}` };
+  return Buffer.concat(blocks).subarray(0, length);
+}
+
+function encryptWebPush(payloadBuffer, p256dhBase64url, authBase64url, options = {}) {
+  const receiverPublicKey = base64urlDecode(p256dhBase64url);
+  const authSecret = base64urlDecode(authBase64url);
+  if (receiverPublicKey.length !== 65 || receiverPublicKey[0] !== 0x04) {
+    throw new Error('UnifiedPush p256dh must be an uncompressed P-256 public key');
+  }
+  if (authSecret.length === 0) {
+    throw new Error('UnifiedPush auth secret is required');
+  }
+
+  const ecdh = createECDH('prime256v1');
+  if (options.senderPrivateKey) {
+    ecdh.setPrivateKey(options.senderPrivateKey);
+  } else {
+    ecdh.generateKeys();
+  }
+  const senderPublicKey = options.senderPublicKey || ecdh.getPublicKey();
+  const salt = options.salt || randomBytes(16);
+  const recordSize = options.recordSize || 4096;
+  const sharedSecret = ecdh.computeSecret(receiverPublicKey);
+
+  const keyInfo = Buffer.concat([
+    Buffer.from('WebPush: info\0', 'utf8'),
+    receiverPublicKey,
+    senderPublicKey,
+  ]);
+  const keyPrk = hkdfExtract(authSecret, sharedSecret);
+  const ikm = hkdfExpand(keyPrk, keyInfo, 32);
+  const contentPrk = hkdfExtract(salt, ikm);
+  const cek = hkdfExpand(contentPrk, Buffer.from('Content-Encoding: aes128gcm\0', 'utf8'), 16);
+  const nonce = hkdfExpand(contentPrk, Buffer.from('Content-Encoding: nonce\0', 'utf8'), 12);
+  const record = Buffer.concat([Buffer.from(payloadBuffer), Buffer.from([0x02])]);
+  const cipher = createCipheriv('aes-128-gcm', cek, nonce);
+  const ciphertext = Buffer.concat([cipher.update(record), cipher.final(), cipher.getAuthTag()]);
+  const rs = Buffer.alloc(4);
+  rs.writeUInt32BE(recordSize, 0);
+  const header = Buffer.concat([salt, rs, Buffer.from([senderPublicKey.length]), senderPublicKey]);
+  return Buffer.concat([header, ciphertext]);
+}
+
+function runWebPushSelfTest() {
+  const plaintext = base64urlDecode('V2hlbiBJIGdyb3cgdXAsIEkgd2FudCB0byBiZSBhIHdhdGVybWVsb24');
+  const uaPublic = 'BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4';
+  const auth = 'BTBZMqHH6r4Tts7J_aSIgg';
+  const senderPrivateKey = base64urlDecode('yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw');
+  const salt = base64urlDecode('DGv6ra1nlYgDCS1FRnbzlw');
+  const expected = [
+    'DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27ml',
+    'mlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPT',
+    'pK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN',
+  ].join('');
+  const encrypted = encryptWebPush(plaintext, uaPublic, auth, { senderPrivateKey, salt });
+  const actual = base64urlEncode(encrypted);
+  if (actual !== expected) {
+    throw new Error('RFC 8291 test vector mismatch');
+  }
+}
+
+function getUnifiedPushConfig(item) {
+  if (!isProviderEnabled(item, 'unifiedpush')) return null;
+  const config = item?.push?.unifiedpush || item?.push?.unifiedPush || {};
+  const endpoint = String(config.endpoint || '').trim();
+  const p256dh = String(config.p256dh || '').trim();
+  const auth = String(config.auth || '').trim();
+  if (!endpoint || !p256dh || !auth) return null;
+  return { endpoint, p256dh, auth };
+}
+
+async function sendUnifiedPushUserMessagePush(item, messageText) {
+  const config = getUnifiedPushConfig(item);
+  if (!config) return { sent: false, reason: 'no-endpoint' };
+  const message = String(messageText || '').trim().slice(0, PUSH_BODY_MAX_CHARS) || '（空消息）';
+  const payload = Buffer.from(JSON.stringify({
+    conversationId: item?.conversationId || '',
+    message,
+  }), 'utf8');
+  const body = encryptWebPush(payload, config.p256dh, config.auth);
+  const response = await fetch(config.endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Encoding': 'aes128gcm',
+      TTL: '86400',
+      Urgency: 'high',
+      'Content-Type': 'application/octet-stream',
+    },
+    body,
+  });
+  const text = await response.text().catch(() => '');
+  if (response.status === 404 || response.status === 410) {
+    if (item?.push?.unifiedpush) {
+      delete item.push.unifiedpush;
+      await saveState().catch(() => undefined);
+    }
+    return { sent: false, reason: 'endpoint-gone' };
+  }
+  if (!response.ok) {
+    throw new Error(`UnifiedPush send ${response.status}: ${text.slice(0, 300)}`);
   }
   return { sent: true };
 }
 
 async function sendUserMessagePushes(item, messageText) {
   const senders = [];
-  if (getServerChanSendKey(item)) {
-    senders.push(['serverchan', () => sendServerChanUserMessagePush(item, messageText)]);
+  if (getNtfyConfig(item)) {
+    senders.push(['ntfy', () => sendNtfyUserMessagePush(item, messageText)]);
   }
-  if (getWxPusherConfig(item)) {
-    senders.push(['wxpusher', () => sendWxPusherUserMessagePush(item, messageText)]);
+  if (getUnifiedPushConfig(item)) {
+    senders.push(['unifiedpush', () => sendUnifiedPushUserMessagePush(item, messageText)]);
   }
   if (senders.length === 0) {
     return [{ channel: 'none', sent: false, reason: 'no-channel' }];
@@ -1049,40 +1109,18 @@ async function runKeepalive(conversationId) {
         message: applyResult.message,
       });
       if (applyResult.logType === 'agent-user-message') {
-        if (getServerChanSendKey(item)) {
-        // 推送失败不能中断保活周期
-        try {
-          const pushResult = await sendServerChanUserMessagePush(item, decision.message);
-          addLog(pushResult.sent ? 'push-ok' : 'push-skipped', {
+        // 推送失败不能中断保活周期：sendUserMessagePushes 内部逐通道 catch
+        const pushResults = await sendUserMessagePushes(item, decision.message);
+        for (const result of pushResults) {
+          addLog(result.sent ? 'push-ok' : result.error ? 'push-error' : 'push-skipped', {
             conversationId,
-            reason: pushResult.reason,
-            message: pushResult.sent ? 'push sent' : `skipped: ${pushResult.reason}`,
+            channel: result.channel,
+            reason: result.reason,
+            error: result.error,
+            message: result.sent
+              ? `${result.channel} push sent`
+              : result.error || `skipped: ${result.reason}`,
           });
-        } catch (error) {
-          addLog('push-error', {
-            conversationId,
-            error: error.message || String(error),
-            message: error.message || String(error),
-          });
-        }
-        }
-        if (getWxPusherConfig(item)) {
-          try {
-            const pushResult = await sendWxPusherUserMessagePush(item, decision.message);
-            addLog(pushResult.sent ? 'push-ok' : 'push-skipped', {
-              conversationId,
-              channel: 'wxpusher',
-              reason: pushResult.reason,
-              message: pushResult.sent ? 'wxpusher push sent' : `skipped: ${pushResult.reason}`,
-            });
-          } catch (error) {
-            addLog('push-error', {
-              conversationId,
-              channel: 'wxpusher',
-              error: error.message || String(error),
-              message: error.message || String(error),
-            });
-          }
         }
       }
     } else {
@@ -1182,22 +1220,44 @@ function normalizeAgentTick(agentTick) {
 function normalizePushConfig(push) {
   if (!push || typeof push !== 'object') return undefined;
   const providerInput = String(push.provider || push.channel || '').trim().toLowerCase();
-  const provider = providerInput === 'serverchan' || providerInput === 'wxpusher' || providerInput === 'both'
+  const provider = PUSH_PROVIDERS.includes(providerInput) || providerInput === 'both' || providerInput === 'all'
     ? providerInput
-    : 'both';
-  const serverChanSendKey = typeof push.serverChanSendKey === 'string' ? push.serverChanSendKey.trim() : '';
-  const wxInput = push.wxPusher && typeof push.wxPusher === 'object' ? push.wxPusher : push;
-  const wxPusherAppToken = typeof wxInput.appToken === 'string' ? wxInput.appToken.trim() : '';
-  const wxPusherUids = splitPushList(wxInput.uids || wxInput.uid);
-  const wxPusherTopicIds = normalizeTopicIds(wxInput.topicIds || wxInput.topicId);
+    : 'all';
+  const ntfyInput = push.ntfy && typeof push.ntfy === 'object' ? push.ntfy : null;
+  const ntfyServerUrl = typeof ntfyInput?.serverUrl === 'string' ? ntfyInput.serverUrl.trim().replace(/\/+$/, '') : '';
+  const ntfyTopic = typeof ntfyInput?.topic === 'string' ? ntfyInput.topic.trim() : '';
+  const ntfyAccessToken = typeof ntfyInput?.accessToken === 'string' ? ntfyInput.accessToken.trim() : '';
+  const upInput = push.unifiedpush && typeof push.unifiedpush === 'object'
+    ? push.unifiedpush
+    : push.unifiedPush && typeof push.unifiedPush === 'object'
+      ? push.unifiedPush
+      : null;
+  const upEndpoint = typeof upInput?.endpoint === 'string' ? upInput.endpoint.trim() : '';
+  const upP256dh = typeof upInput?.p256dh === 'string' ? upInput.p256dh.trim() : '';
+  const upAuth = typeof upInput?.auth === 'string' ? upInput.auth.trim() : '';
+  const allowAll = provider === 'both' || provider === 'all';
   const normalized = {};
-  if ((provider === 'serverchan' || provider === 'both') && serverChanSendKey) normalized.serverChanSendKey = serverChanSendKey;
-  if ((provider === 'wxpusher' || provider === 'both') && wxPusherAppToken && (wxPusherUids.length > 0 || wxPusherTopicIds.length > 0)) {
-    normalized.wxPusher = {
-      appToken: wxPusherAppToken,
-      uids: wxPusherUids,
-      topicIds: wxPusherTopicIds,
+  if ((provider === 'ntfy' || allowAll) && ntfyTopic) {
+    normalized.ntfy = {
+      serverUrl: ntfyServerUrl,
+      topic: ntfyTopic,
+      accessToken: ntfyAccessToken,
     };
+  }
+  if ((provider === 'unifiedpush' || allowAll) && upEndpoint && upP256dh && upAuth) {
+    let endpointUrl = null;
+    try {
+      endpointUrl = new URL(upEndpoint);
+    } catch {
+      endpointUrl = null;
+    }
+    if (endpointUrl?.protocol === 'https:') {
+      normalized.unifiedpush = {
+        endpoint: upEndpoint,
+        p256dh: upP256dh,
+        auth: upAuth,
+      };
+    }
   }
   if (Object.keys(normalized).length) normalized.provider = provider;
   return Object.keys(normalized).length ? normalized : undefined;
@@ -1370,7 +1430,7 @@ function publicStatus() {
     preview: item.preview,
     agentToolsEnabled: getAgentToolDefinitions(item.agentTools).map((tool) => tool.function.name),
     agentTickEnabled: item.agentTick ? item.agentTick.enabled === true : getAgentToolDefinitions(item.agentTools).length > 0,
-    pushConfigured: Boolean(getServerChanSendKey(item) || getWxPusherConfig(item)),
+    pushConfigured: Boolean(getNtfyConfig(item) || getUnifiedPushConfig(item)),
     pendingMessageCount: (item.pendingMessages || []).filter((message) => !message.consumed).length,
     activityCount: (item.activityLog || []).filter((entry) => !entry.consumed).length,
   }));
@@ -1920,18 +1980,6 @@ async function handlePushTest(req, res) {
     results,
     error: ok ? undefined : results[0]?.error || results[0]?.reason,
   });
-  return;
-  try {
-    const result = await sendServerChanUserMessagePush(item, input.message || 'YSClaude 推送测试：Server酱通道工作正常。');
-    addLog(result.sent ? 'push-test-ok' : 'push-test-skipped', {
-      reason: result.reason,
-      message: result.sent ? 'test push sent' : `skipped: ${result.reason}`,
-    });
-    jsonResponse(res, result.sent ? 200 : 400, { ok: result.sent, reason: result.reason });
-  } catch (error) {
-    addLog('push-test-error', { error: error.message || String(error), message: error.message || String(error) });
-    jsonResponse(res, 502, { ok: false, error: error.message || String(error) });
-  }
 }
 
 async function route(req, res) {
@@ -2024,14 +2072,14 @@ async function route(req, res) {
 }
 
 await loadState();
-if (SERVERCHAN_SENDKEY) {
-  console.log('[push] ServerChan fallback SendKey configured');
-} else {
-  console.log('[push] no SERVERCHAN_SENDKEY env; push uses per-conversation SendKey from client');
+try {
+  runWebPushSelfTest();
+  console.log('[webpush] self-test ok');
+} catch (error) {
+  console.error('[webpush] self-test failed:', error.message || String(error));
 }
-if (WXPUSHER_APP_TOKEN) {
-  console.log('[push] WxPusher fallback AppToken configured');
-}
+console.log(`[push] providers enabled: ${PUSH_PROVIDERS.join(', ')}`);
+console.log(NTFY_TOPIC ? '[push] ntfy fallback topic configured' : '[push] ntfy uses per-conversation topic from client');
 for (const item of Object.values(state.conversations)) {
   if (item.status === 'active') {
     scheduleConversation(item.conversationId);
