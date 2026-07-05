@@ -626,6 +626,11 @@ function buildDingTalkWebhookUrl(webhook, secret) {
   return url.toString();
 }
 
+function buildDingTalkMessageTitle(messageText) {
+  const preview = normalizePreviewText(messageText).slice(0, 60);
+  return preview ? `${DINGTALK_TITLE}：${preview}` : DINGTALK_TITLE;
+}
+
 async function sendDingTalkUserMessagePush(item, messageText) {
   const config = getDingTalkConfig(item);
   if (!config) return { sent: false, reason: 'no-dingtalk-webhook' };
@@ -639,7 +644,7 @@ async function sendDingTalkUserMessagePush(item, messageText) {
   const body = {
     msgtype: 'markdown',
     markdown: {
-      title: DINGTALK_TITLE,
+      title: buildDingTalkMessageTitle(message),
       text,
     },
     at: {
