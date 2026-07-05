@@ -29,6 +29,9 @@ KEEPALIVE_INTERVAL_MS=3300000
 NTFY_SERVER_URL=https://ntfy.sh
 NTFY_TOPIC=
 NTFY_ACCESS_TOKEN=
+WXPUSHER_APP_TOKEN=
+WXPUSHER_UIDS=
+WXPUSHER_TOPIC_IDS=
 YSCLAUDE_APP_DEEPLINK_BASE=ysclaude://chat/
 ```
 
@@ -167,6 +170,12 @@ This model does not support assistant message prefill.
 ```
 
 这条消息只用于本次保活请求，不会写入服务端快照，也不会同步到 App 对话。
+
+## WxPusher 回退推送
+
+- 可使用 `WXPUSHER_APP_TOKEN`、`WXPUSHER_UIDS`、`WXPUSHER_TOPIC_IDS` 作为服务端兜底配置。
+- App 也可以上报每个会话自己的 WxPusher AppToken、UID 或 Topic ID。
+- 适合一加等严格杀后台机型作为稳定兜底；通知来自 WxPusher/微信，点击可通过 deep link 回到 YSClaude。
 
 ## 接口
 

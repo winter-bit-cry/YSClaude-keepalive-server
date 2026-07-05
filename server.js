@@ -19,6 +19,9 @@ const AGENT_ACTIVITY_MAX_TOOL_ROUNDS = Number(process.env.AGENT_ACTIVITY_MAX_TOO
 const NTFY_SERVER_URL = process.env.NTFY_SERVER_URL || 'https://ntfy.sh';
 const NTFY_TOPIC = process.env.NTFY_TOPIC || '';
 const NTFY_ACCESS_TOKEN = process.env.NTFY_ACCESS_TOKEN || '';
+const WXPUSHER_APP_TOKEN = process.env.WXPUSHER_APP_TOKEN || '';
+const WXPUSHER_UIDS = process.env.WXPUSHER_UIDS || '';
+const WXPUSHER_TOPIC_IDS = process.env.WXPUSHER_TOPIC_IDS || '';
 const YSCLAUDE_APP_DEEPLINK_BASE = process.env.YSCLAUDE_APP_DEEPLINK_BASE || 'ysclaude://chat/';
 const PUSH_BODY_MAX_CHARS = 200;
 
@@ -389,7 +392,7 @@ function shouldRetryWithOneToken(error) {
   return text.includes('max_tokens') || text.includes('max tokens') || text.includes('greater than 0');
 }
 
-const PUSH_PROVIDERS = ['ntfy', 'unifiedpush'];
+const PUSH_PROVIDERS = ['ntfy', 'unifiedpush', 'wxpusher'];
 
 function getPushProvider(item) {
   const provider = String(item?.push?.provider || '').trim().toLowerCase();
@@ -411,6 +414,24 @@ function buildConversationDeepLink(conversationId) {
   if (!base) return `ysclaude://chat/${encodedId}`;
   if (base.includes('{conversationId}')) return base.replaceAll('{conversationId}', encodedId);
   return `${base.replace(/\/?$/, '/')}${encodedId}`;
+}
+
+function splitPushList(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => String(item || '').trim())
+      .filter(Boolean);
+  }
+  return String(value || '')
+    .split(/[\s,;，；]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeTopicIds(value) {
+  return splitPushList(value)
+    .map((item) => Number.parseInt(item, 10))
+    .filter((item) => Number.isFinite(item) && item > 0);
 }
 
 function getNtfyConfig(item) {
@@ -446,6 +467,47 @@ async function sendNtfyUserMessagePush(item, messageText) {
   const text = await response.text().catch(() => '');
   if (!response.ok) {
     throw new Error(`Ntfy send ${response.status}: ${text.slice(0, 300)}`);
+  }
+  return { sent: true };
+}
+
+function getWxPusherConfig(item) {
+  if (!isProviderEnabled(item, 'wxpusher')) return null;
+  const config = item?.push?.wxPusher || item?.push?.wxpusher || {};
+  const appToken = String(config.appToken || WXPUSHER_APP_TOKEN || '').trim();
+  const uids = splitPushList(config.uids || config.uid || WXPUSHER_UIDS);
+  const topicIds = normalizeTopicIds(config.topicIds || config.topicId || WXPUSHER_TOPIC_IDS);
+  if (!appToken || (uids.length === 0 && topicIds.length === 0)) return null;
+  return { appToken, uids, topicIds };
+}
+
+async function sendWxPusherUserMessagePush(item, messageText) {
+  const config = getWxPusherConfig(item);
+  if (!config) return { sent: false, reason: 'no-wxpusher-config' };
+
+  const content = String(messageText || '').trim().slice(0, PUSH_BODY_MAX_CHARS) || '（空消息）';
+  const body = {
+    appToken: config.appToken,
+    content,
+    summary: 'Claude在呼叫你……',
+    contentType: 1,
+    url: buildConversationDeepLink(item?.conversationId),
+  };
+  if (config.uids.length > 0) body.uids = config.uids;
+  if (config.topicIds.length > 0) body.topicIds = config.topicIds;
+
+  const response = await fetch('https://wxpusher.zjiecode.com/api/send/message', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json;charset=utf-8' },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text().catch(() => '');
+  if (!response.ok) {
+    throw new Error(`WxPusher send ${response.status}: ${text.slice(0, 300)}`);
+  }
+  const data = text ? JSON.parse(text) : null;
+  if (data && data.code !== 1000) {
+    return { sent: false, reason: data.msg || data.message || `wxpusher-code-${data.code}` };
   }
   return { sent: true };
 }
@@ -582,6 +644,9 @@ async function sendUnifiedPushUserMessagePush(item, messageText) {
 
 async function sendUserMessagePushes(item, messageText) {
   const senders = [];
+  if (getWxPusherConfig(item)) {
+    senders.push(['wxpusher', () => sendWxPusherUserMessagePush(item, messageText)]);
+  }
   if (getNtfyConfig(item)) {
     senders.push(['ntfy', () => sendNtfyUserMessagePush(item, messageText)]);
   }
@@ -1227,6 +1292,14 @@ function normalizePushConfig(push) {
   const ntfyServerUrl = typeof ntfyInput?.serverUrl === 'string' ? ntfyInput.serverUrl.trim().replace(/\/+$/, '') : '';
   const ntfyTopic = typeof ntfyInput?.topic === 'string' ? ntfyInput.topic.trim() : '';
   const ntfyAccessToken = typeof ntfyInput?.accessToken === 'string' ? ntfyInput.accessToken.trim() : '';
+  const wxInput = push.wxPusher && typeof push.wxPusher === 'object'
+    ? push.wxPusher
+    : push.wxpusher && typeof push.wxpusher === 'object'
+      ? push.wxpusher
+      : null;
+  const wxAppToken = typeof wxInput?.appToken === 'string' ? wxInput.appToken.trim() : '';
+  const wxUids = splitPushList(wxInput?.uids || wxInput?.uid);
+  const wxTopicIds = normalizeTopicIds(wxInput?.topicIds || wxInput?.topicId);
   const upInput = push.unifiedpush && typeof push.unifiedpush === 'object'
     ? push.unifiedpush
     : push.unifiedPush && typeof push.unifiedPush === 'object'
@@ -1242,6 +1315,13 @@ function normalizePushConfig(push) {
       serverUrl: ntfyServerUrl,
       topic: ntfyTopic,
       accessToken: ntfyAccessToken,
+    };
+  }
+  if ((provider === 'wxpusher' || allowAll) && wxAppToken && (wxUids.length > 0 || wxTopicIds.length > 0)) {
+    normalized.wxPusher = {
+      appToken: wxAppToken,
+      uids: wxUids,
+      topicIds: wxTopicIds,
     };
   }
   if ((provider === 'unifiedpush' || allowAll) && upEndpoint && upP256dh && upAuth) {
@@ -1430,7 +1510,7 @@ function publicStatus() {
     preview: item.preview,
     agentToolsEnabled: getAgentToolDefinitions(item.agentTools).map((tool) => tool.function.name),
     agentTickEnabled: item.agentTick ? item.agentTick.enabled === true : getAgentToolDefinitions(item.agentTools).length > 0,
-    pushConfigured: Boolean(getNtfyConfig(item) || getUnifiedPushConfig(item)),
+    pushConfigured: Boolean(getNtfyConfig(item) || getUnifiedPushConfig(item) || getWxPusherConfig(item)),
     pendingMessageCount: (item.pendingMessages || []).filter((message) => !message.consumed).length,
     activityCount: (item.activityLog || []).filter((entry) => !entry.consumed).length,
   }));
@@ -2080,6 +2160,7 @@ try {
 }
 console.log(`[push] providers enabled: ${PUSH_PROVIDERS.join(', ')}`);
 console.log(NTFY_TOPIC ? '[push] ntfy fallback topic configured' : '[push] ntfy uses per-conversation topic from client');
+console.log(WXPUSHER_APP_TOKEN ? '[push] WxPusher fallback AppToken configured' : '[push] WxPusher uses per-conversation config from client');
 for (const item of Object.values(state.conversations)) {
   if (item.status === 'active') {
     scheduleConversation(item.conversationId);
