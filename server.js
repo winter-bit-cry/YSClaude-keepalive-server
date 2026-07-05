@@ -22,6 +22,7 @@ const WXPUSHER_TOPIC_IDS = process.env.WXPUSHER_TOPIC_IDS || '';
 const DINGTALK_WEBHOOK = process.env.DINGTALK_WEBHOOK || '';
 const DINGTALK_SECRET = process.env.DINGTALK_SECRET || '';
 const DINGTALK_AT_MOBILES = process.env.DINGTALK_AT_MOBILES || '';
+const DINGTALK_TITLE = String(process.env.DINGTALK_TITLE || 'YSClaude').trim() || 'YSClaude';
 const YSCLAUDE_APP_DEEPLINK_BASE = process.env.YSCLAUDE_APP_DEEPLINK_BASE || 'ysclaude://chat/';
 const PUSH_BODY_MAX_CHARS = 200;
 
@@ -504,15 +505,13 @@ async function sendDingTalkUserMessagePush(item, messageText) {
   const message = String(messageText || '').trim().slice(0, PUSH_BODY_MAX_CHARS) || '（空消息）';
   const link = buildConversationDeepLink(item?.conversationId);
   const text = [
-    '### YSClaude',
-    '',
     message,
     link ? `\n[打开 YSClaude](${link})` : '',
   ].filter(Boolean).join('\n');
   const body = {
     msgtype: 'markdown',
     markdown: {
-      title: 'YSClaude',
+      title: DINGTALK_TITLE,
       text,
     },
     at: {
@@ -1021,15 +1020,22 @@ function appendAgentDecisionToSnapshot(item, decision, toolTranscript) {
     return { changed: true, logType: 'agent-activity', message: normalizePreviewText(summary) };
   }
 
+  const summary = decision.reason || '模型选择不主动行动。';
+  const contextMessages = [{
+    role: 'assistant',
+    content: `[远程自主判断]\n${summary}`,
+  }];
+  item.request.messages.push(...contextMessages);
   item.activityLog.push({
     id: randomUUID(),
     type: 'noop',
-    summary: decision.reason || '模型选择不主动行动。',
+    summary,
     toolTranscript,
+    appendedMessages: contextMessages,
     createdAt,
-    consumed: true,
+    consumed: false,
   });
-  return { changed: false, logType: 'agent-noop', message: decision.reason || 'noop' };
+  return { changed: true, logType: 'agent-noop', message: normalizePreviewText(summary) };
 }
 
 async function runKeepalive(conversationId) {
