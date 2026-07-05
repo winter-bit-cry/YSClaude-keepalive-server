@@ -24,7 +24,12 @@ const DINGTALK_SECRET = process.env.DINGTALK_SECRET || '';
 const DINGTALK_AT_MOBILES = process.env.DINGTALK_AT_MOBILES || '';
 const DINGTALK_TITLE = String(process.env.DINGTALK_TITLE || 'YSClaude').trim() || 'YSClaude';
 const YSCLAUDE_APP_DEEPLINK_BASE = process.env.YSCLAUDE_APP_DEEPLINK_BASE || 'ysclaude://chat/';
+const USER_TIME_ZONE = process.env.USER_TIME_ZONE || process.env.TZ || 'Asia/Shanghai';
 const PUSH_BODY_MAX_CHARS = 200;
+const APP_KEEPALIVE_SUFFIX = '这是一次 Prompt 缓存保活请求。请不要输出任何内容。';
+const SERVER_KEEPALIVE_PING = '[Server keepalive ping] Keep the prompt cache warm. Do not answer this message.';
+const RUNTIME_CONTEXT_PREFIX = '以下是本轮运行时上下文和应用附加信息：';
+const USER_LATEST_INPUT_MARKER = '用户最新输入：';
 
 const state = {
   conversations: {},
@@ -194,6 +199,10 @@ function snapshotHash(payload) {
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
 function addLog(type, details = {}) {
   const entry = {
     id: randomUUID(),
@@ -231,6 +240,125 @@ function extractMessageText(content) {
     })
     .filter(Boolean)
     .join(' ');
+}
+
+function stripRuntimeLatestInputWrapper(content) {
+  if (typeof content === 'string') {
+    if (!content.includes(RUNTIME_CONTEXT_PREFIX)) return content;
+    const markerIndex = content.indexOf(USER_LATEST_INPUT_MARKER);
+    if (markerIndex < 0) return content;
+    const latestInput = content.slice(markerIndex + USER_LATEST_INPUT_MARKER.length).replace(/^\s+/, '');
+    return latestInput || content;
+  }
+
+  if (!Array.isArray(content) || content.length === 0) return content;
+  const first = content[0];
+  if (!first || typeof first !== 'object' || typeof first.text !== 'string') return content;
+  if (!first.text.includes(RUNTIME_CONTEXT_PREFIX)) return content;
+
+  const markerIndex = first.text.indexOf(USER_LATEST_INPUT_MARKER);
+  if (markerIndex < 0) return content;
+
+  const latestInputPrefix = first.text.slice(markerIndex + USER_LATEST_INPUT_MARKER.length).replace(/^\s+/, '');
+  if (latestInputPrefix) {
+    return [
+      { ...first, text: latestInputPrefix },
+      ...content.slice(1),
+    ];
+  }
+  return content.slice(1);
+}
+
+function findPromptCacheControl(messages) {
+  for (const message of messages) {
+    const content = message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (part && typeof part === 'object' && part.cache_control) {
+        return cloneJson(part.cache_control);
+      }
+    }
+  }
+  return null;
+}
+
+function clearPromptCacheControls(messages) {
+  return messages.map((message) => {
+    const content = message?.content;
+    if (!Array.isArray(content)) return message;
+    return {
+      ...message,
+      content: content.map((part) => {
+        if (!part || typeof part !== 'object' || !part.cache_control) return part;
+        const { cache_control, ...rest } = part;
+        return rest;
+      }),
+    };
+  });
+}
+
+function applyPromptCacheControlToLastText(messages, cacheControl) {
+  if (!cacheControl) return messages;
+  const next = clearPromptCacheControls(messages);
+
+  for (let i = next.length - 1; i >= 0; i--) {
+    const message = next[i];
+    if (!message || (message.role !== 'user' && message.role !== 'assistant' && message.role !== 'system')) continue;
+
+    if (typeof message.content === 'string' && message.content.trim()) {
+      next[i] = {
+        ...message,
+        content: [{
+          type: 'text',
+          text: message.content,
+          cache_control: cacheControl,
+        }],
+      };
+      return next;
+    }
+
+    if (!Array.isArray(message.content)) continue;
+    for (let j = message.content.length - 1; j >= 0; j--) {
+      const part = message.content[j];
+      if (part && typeof part === 'object' && typeof part.text === 'string' && part.text.trim()) {
+        next[i] = {
+          ...message,
+          content: message.content.map((item, index) =>
+            index === j ? { ...item, cache_control: cacheControl } : item
+          ),
+        };
+        return next;
+      }
+    }
+  }
+
+  return next;
+}
+
+function isKeepaliveSuffixMessage(message) {
+  if (!message || message.role !== 'user') return false;
+  const text = extractMessageText(message.content).replace(/\s+/g, ' ').trim();
+  return text === APP_KEEPALIVE_SUFFIX || text === SERVER_KEEPALIVE_PING;
+}
+
+function normalizeSnapshotRequest(request) {
+  const normalized = cloneJson(request);
+  const messages = Array.isArray(normalized.messages) ? normalized.messages : [];
+  const cacheControl = findPromptCacheControl(messages);
+  let normalizedMessages = messages.map((message) => {
+    if (!message || message.role !== 'user') return message;
+    return {
+      ...message,
+      content: stripRuntimeLatestInputWrapper(message.content),
+    };
+  });
+
+  while (normalizedMessages.length > 0 && isKeepaliveSuffixMessage(normalizedMessages[normalizedMessages.length - 1])) {
+    normalizedMessages.pop();
+  }
+
+  normalized.messages = applyPromptCacheControlToLastText(normalizedMessages, cacheControl);
+  return normalized;
 }
 
 function buildSnapshotPreview(request) {
@@ -793,29 +921,60 @@ function buildAgentTickToolLines(item, tools) {
   ];
 }
 
+function formatElapsedDurationZh(minutes) {
+  const safeMinutes = Math.max(0, Math.round(Number(minutes) || 0));
+  if (safeMinutes < 60) return `${safeMinutes} 分钟`;
+  const hours = Math.floor(safeMinutes / 60);
+  const restMinutes = safeMinutes % 60;
+  if (hours < 24) {
+    return restMinutes > 0 ? `${hours} 小时 ${restMinutes} 分钟` : `${hours} 小时`;
+  }
+  const days = Math.floor(hours / 24);
+  const restHours = hours % 24;
+  return restHours > 0 ? `${days} 天 ${restHours} 小时` : `${days} 天`;
+}
+
+function formatUserLocalTime(timestamp) {
+  try {
+    return new Date(timestamp).toLocaleString('zh-CN', {
+      timeZone: USER_TIME_ZONE,
+      hour12: false,
+    });
+  } catch {
+    return new Date(timestamp).toLocaleString('zh-CN', { hour12: false });
+  }
+}
+
 function buildAgentTickPrompt(item, plannedAt, tools) {
   const lastUserSnapshotAt = item.lastUserSnapshotAt || item.lastSnapshotAt || item.updatedAt || item.lastTouchedAt || plannedAt;
   const elapsedUserMinutes = Math.max(0, Math.round((plannedAt - lastUserSnapshotAt) / 60000));
   const currentTime = now();
+  const elapsedText = formatElapsedDurationZh(elapsedUserMinutes);
+  const localTimeText = formatUserLocalTime(currentTime);
   return [
-    `Current server time: ${new Date(currentTime).toISOString()}`,
-    `This wake was planned for: ${new Date(plannedAt).toISOString()}`,
-    `Last user snapshot time: ${new Date(lastUserSnapshotAt).toISOString()}`,
-    `Minutes since last user snapshot: ${elapsedUserMinutes}`,
-    'Use "last user snapshot" as the time since the user last talked in the app. Do not reset it for ordinary server keepalive.',
-    'Always include "next_awake" in the final JSON. Use an ISO 8601 timestamp for when you want to be awakened next.',
-    'If the next wake is more than 55 minutes away, the server will run ordinary cache keepalive every 55 minutes until that time.',
-    `距离用户上次在 App 侧对话/上传快照已经过去约 ${elapsedUserMinutes} 分钟。`,
+    `当前服务器时间：${new Date(currentTime).toISOString()}`,
+    `当前用户本地时间（${USER_TIME_ZONE}）：${localTimeText}`,
+    `本次唤醒原计划时间：${new Date(plannedAt).toISOString()}`,
+    `用户上次在 App 侧对话/上传快照时间：${new Date(lastUserSnapshotAt).toISOString()}`,
+    `距离上次对话分钟数：${elapsedUserMinutes}`,
+    '这里的“上次对话”指用户上次在 App 侧真实对话/上传快照的时间；普通服务器保活不能重置这个时间。',
+    '本条 tick prompt 之前的所有消息都是历史对话上下文，不要把上一条 user 消息当作刚刚发生的最新消息。',
+    '决策前先根据已经过去的时间、用户本地时间和历史对话推断用户此刻可能在做什么；如果不联系用户，必须安排更合适的 next_awake。',
+    '避免重复你已经发过的消息或提醒。只有在此刻确实能提供新的明确价值时，才选择 user_message。',
+    '最终 JSON 必须包含 next_awake，值为 ISO 8601 时间戳，表示你希望下一次被唤醒的时间。',
+    '如果 next_awake 距离当前超过 55 分钟，服务器会每 55 分钟执行普通缓存保活，直到该唤醒时间。',
+    `距离上次对话已经过去约 ${elapsedText}。结合历史对话和当前时间，用户此刻可能在睡觉、工作、通勤、吃饭、休息、等待提醒，还是已经不需要被打扰？`,
     '你正在服务器端执行一次远程保活/自主活动 tick。',
-    '你可以先什么都不做，也可以给用户留一条消息，也可以只进行内部活动记录。',
+    '请把本条 tick prompt 之前的所有 user/assistant 消息都当作历史对话来理解；不要沿用上一轮请求里“用户最新输入/最新消息”的结构。',
+    '你可以主动给用户发消息、自己活动，或什么都不做。如果不联系用户，需安排更合适的下次唤醒时间。',
+    '没有足够新信息或容易重复时，优先 noop；但 noop 也必须认真选择 next_awake，而不是机械延后。',
     ...buildAgentTickToolLines(item, tools),
     '最终必须只输出 JSON，不要 Markdown，不要额外解释：',
     '{"action":"noop","reason":"...","next_awake":"2026-07-04T12:30:00.000Z"}',
     '{"action":"user_message","message":"...","reason":"...","next_awake":"2026-07-04T12:30:00.000Z"}',
-    'JSON without "next_awake" is invalid.',
-    'Every final JSON object must include "next_awake".',
-    '{"action":"user_message","message":"发给用户的消息","reason":"..."}',
-    '{"action":"agent_activity","summary":"内部活动摘要","messagesToAppend":[{"role":"assistant","content":"可选：要写入后续上下文的简短记录"}]}',
+    '缺少 next_awake 的 JSON 无效。',
+    '每一个最终 JSON 对象都必须包含 next_awake。',
+    '{"action":"agent_activity","summary":"内部活动摘要","messagesToAppend":[{"role":"assistant","content":"可选：要写入后续上下文的简短记录"}],"next_awake":"2026-07-04T12:30:00.000Z"}',
   ].join('\n');
 }
 
@@ -1253,8 +1412,9 @@ function normalizeAgentTools(agentTools) {
 async function handleSnapshot(req, res) {
   const input = validateSnapshot(await readJsonBody(req));
   const touchedAt = now();
-  const hash = snapshotHash(input.request);
-  const preview = buildSnapshotPreview(input.request);
+  const request = normalizeSnapshotRequest(input.request);
+  const hash = snapshotHash(request);
+  const preview = buildSnapshotPreview(request);
   const existing = state.conversations[input.conversationId] || {};
   const initialSchedule = computeNextSchedule(
     { agentTools: input.agentTools, agentTick: input.agentTick },
@@ -1271,7 +1431,7 @@ async function handleSnapshot(req, res) {
   state.conversations[input.conversationId] = {
     conversationId: input.conversationId,
     snapshotHash: hash,
-    request: input.request,
+    request,
     quietHours: input.quietHours,
     agentTools: input.agentTools,
     agentTick: input.agentTick,

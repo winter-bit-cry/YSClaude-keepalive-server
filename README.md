@@ -1,43 +1,66 @@
 # YSClaude Keepalive Server
 
-轻量自托管的 YSClaude 远程 Prompt Cache 保活与 AI 定时唤醒服务。
+YSClaude Keepalive Server 是给 YSClaude App 使用的远程 Prompt Cache 保活、AI 定时唤醒和离线消息同步服务。
 
-它接收 YSClaude App 上传的最后一次成功使用 `1h` Prompt Cache 的请求快照，保存到服务端，并在 App 离线时继续维持缓存、执行远程 AI 自主 tick，通过 ntfy 或 UnifiedPush 发送提醒，并让 App 下次启动/前台时同步远程收件箱。
+App 会把最近一次可恢复的对话请求快照上传到服务端。用户离开 App 后，服务端继续按计划维持缓存，并在合适的时间唤醒 AI，让 AI 决定是否给用户留言、记录一次自主活动，或者暂时不打扰。用户下次打开 App 或点击推送进入对话时，本地会同步服务端的离线收件箱和活动记录。
+
+当前推送方式只保留两种，二选一：
+
+- 钉钉自定义机器人
+- WxPusher
 
 ## 功能
 
-- 远程保活：按 `KEEPALIVE_INTERVAL_MS` 保持 `1h` Prompt Cache，默认 55 分钟。
-- AI 自主唤醒：AI 每次被唤醒时必须返回 `next_awake`，服务端据此安排下一次 AI tick。
-- 长间隔补保活：如果 `next_awake` 距当前时间超过 55 分钟，服务端会先做普通保活，到点后再唤醒 AI。
-- 推送提醒：支持 ntfy 直推和 Android UnifiedPush。UnifiedPush 正文使用 WebPush `aes128gcm` 端到端加密，通知由 YSClaude App 自身弹出。
-- 远程收件箱：AI 主动留言写入 `pendingMessages`，App 下次启动或打开对话时同步。
-- 远程活动日志：AI 内部活动写入 `activityLog`，可由 App 同步。
-- 勿扰清空：每天进入勿扰时间后，服务端会清空所有快照、保活 timer、日志和待收件数据。
-- 管理面板：`/admin` 可查看快照、下次保活、下次 AI 唤醒、待收件数和日志。
+- 远程保活：按 `KEEPALIVE_INTERVAL_MS` 维持 `1h` Prompt Cache，默认 55 分钟。
+- AI 定时唤醒：AI 每次被唤醒时必须返回下一次 `next_awake`，服务端据此安排下一轮。
+- 长间隔补保活：如果 `next_awake` 距离当前时间超过保活间隔，服务端会先做普通保活，到点后再唤醒 AI。
+- 离线收件箱：AI 主动给用户的消息写入 `pendingMessages`，App 下次同步后写回本地聊天记录。
+- 自主活动记录：AI 的工具活动、内部判断、`noop` 理由会写入 `activityLog`，App 同步后也会写回本地聊天记录。
+- 推送提醒：AI 选择给用户留言时，通过钉钉或 WxPusher 推送消息预览和 deep link。
+- 勿扰清理：进入勿扰时间后，服务端清空快照、定时器、日志和待同步数据。
+- 管理面板：`/admin` 可查看快照、下次保活、下次 AI 唤醒、推送状态和日志。
 
-## Zeabur 部署
-
-1. 把本目录推送到 GitHub 仓库。
-2. 在 Zeabur 新建 Service，选择该 GitHub 仓库。
-3. 设置环境变量：
+## 环境变量
 
 ```text
-KEEPALIVE_AUTH_TOKEN=换成你自己的长随机令牌
+PORT=8789
+HOST=0.0.0.0
+KEEPALIVE_AUTH_TOKEN=replace-with-a-long-random-token
 KEEPALIVE_INTERVAL_MS=3300000
 
 WXPUSHER_APP_TOKEN=
 WXPUSHER_UIDS=
 WXPUSHER_TOPIC_IDS=
+
 DINGTALK_WEBHOOK=
 DINGTALK_SECRET=
 DINGTALK_AT_MOBILES=
 DINGTALK_TITLE=YSClaude
+
 YSCLAUDE_APP_DEEPLINK_BASE=ysclaude://chat/
 ```
 
-`PORT` 由 Zeabur 注入，不需要手动设置。服务会读取 `process.env.PORT`。
+说明：
 
-4. 部署完成后打开：
+- `KEEPALIVE_AUTH_TOKEN`：服务端鉴权令牌，App 设置里的访问令牌要与它一致。
+- `KEEPALIVE_INTERVAL_MS`：普通保活间隔，默认推荐 `3300000`，即 55 分钟。
+- `YSCLAUDE_APP_DEEPLINK_BASE`：推送点击后打开 App 对话的 deep link 前缀。
+- `DINGTALK_TITLE`：钉钉 markdown 的内部标题字段。当前可见正文只包含消息预览和“打开 YSClaude”链接。
+
+## Zeabur 部署
+
+1. 把本目录推送到 GitHub 仓库。
+2. 在 Zeabur 新建 Service，选择该 GitHub 仓库。
+3. 设置环境变量，至少填写：
+
+```text
+KEEPALIVE_AUTH_TOKEN=换成你自己的长随机令牌
+KEEPALIVE_INTERVAL_MS=3300000
+YSCLAUDE_APP_DEEPLINK_BASE=ysclaude://chat/
+```
+
+4. 按你选择的推送方式填写钉钉或 WxPusher 配置。
+5. 部署完成后打开：
 
 ```text
 https://你的-zeabur-域名/health
@@ -45,108 +68,139 @@ https://你的-zeabur-域名/health
 
 看到 `{ "ok": true }` 即可。
 
-管理面板在：
+管理面板：
 
 ```text
 https://你的-zeabur-域名/admin
 ```
 
-5. 在 YSClaude App 中进入：
+## App 配置
 
-`设置 -> 对话设置 -> Prompt 缓存 -> 保活方式 -> 远程保活`
+在 YSClaude App 中进入：
+
+```text
+设置 -> 对话设置 -> Prompt 缓存 -> 保活方式 -> 远程保活
+```
 
 填写：
 
 - 服务地址：`https://你的-zeabur-域名`
 - 访问令牌：`KEEPALIVE_AUTH_TOKEN`
-- 推送通道：Ntfy、UnifiedPush 或全部
+- 推送通道：选择 `钉钉` 或 `WxPusher`
+
+App 会在上传快照时把当前会话的推送配置一并上报。服务端也支持用环境变量作为兜底配置。
+
+## 钉钉推送
+
+钉钉使用群自定义机器人 Webhook。
+
+服务端兜底环境变量：
+
+```text
+DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=...
+DINGTALK_SECRET=SEC...
+DINGTALK_AT_MOBILES=
+DINGTALK_TITLE=YSClaude
+```
+
+推送内容格式：
+
+```text
+消息预览
+
+打开 YSClaude
+```
+
+点击链接后会通过 deep link 打开对应会话。正文不再显示额外标题行。
+
+## WxPusher 推送
+
+WxPusher 使用 AppToken + UID 或 Topic ID。
+
+服务端兜底环境变量：
+
+```text
+WXPUSHER_APP_TOKEN=AT_xxx
+WXPUSHER_UIDS=UID_xxx
+WXPUSHER_TOPIC_IDS=
+```
+
+说明：
+
+- `WXPUSHER_UIDS` 可填写一个或多个 UID，用英文逗号、空格或分号分隔。
+- `WXPUSHER_TOPIC_IDS` 可填写一个或多个 Topic ID。
+- App 也可以上报每个会话自己的 WxPusher 配置，优先级高于服务端兜底配置。
 
 ## 本地启动
 
 ```powershell
 cd E:\Desktop\YSClaude-project\YSClaude-keepalive-server
 $env:KEEPALIVE_AUTH_TOKEN="换成你自己的长随机令牌"
-$env:NTFY_TOPIC="ysclaude-随机长字符串"
+$env:DINGTALK_WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=..."
 npm.cmd start
 ```
 
-默认监听 `0.0.0.0:8789`。可用环境变量调整：
+默认监听 `0.0.0.0:8789`。
 
-```powershell
-$env:HOST="0.0.0.0"
-$env:PORT="8789"
-$env:KEEPALIVE_INTERVAL_MS="3300000"
-```
+## AI 定时唤醒
 
-## AI 定时唤醒规则
+服务端 AI tick 会告诉 AI：
 
-服务端 AI tick 的提示词会告诉 AI：
-
-- 当前服务器时间。
+- 当前服务端时间。
 - 本次计划唤醒时间。
 - 用户/App 最后一次上传快照时间。
-- 距离用户最后一次在 App 侧对话/上传快照过去了多少分钟。
-- 最终 JSON 必须包含 `next_awake`。
+- 距离用户最后一次在 App 侧对话已经过去多久。
+- 最终必须返回 JSON，并包含 `next_awake`。
 
-AI 返回示例：
-
-```json
-{"action":"noop","reason":"暂时不需要行动","next_awake":"2026-07-04T12:30:00.000Z"}
-```
-
-也支持：
+示例：
 
 ```json
-{"action":"user_message","message":"我想起一件事。","reason":"需要提醒用户","nextAwakeAt":"2026-07-04T12:30:00.000Z"}
+{"action":"noop","reason":"当前用户可能正在忙，暂时不打扰。","next_awake":"2026-07-04T12:30:00.000Z"}
 ```
 
-或以分钟为单位：
+也可以给用户留言：
 
 ```json
-{"action":"noop","reason":"稍后再看","next_awake_minutes":90}
+{"action":"user_message","message":"我想提醒你，下午可以留 10 分钟复盘一下。","reason":"用户之前提到需要复盘提醒。","next_awake":"2026-07-04T14:30:00.000Z"}
 ```
 
-调度逻辑：
+也可以只做内部活动：
 
-- `next_awake <= 当前时间 + 55 分钟`：直接按 `next_awake` 唤醒 AI。
-- `next_awake > 当前时间 + 55 分钟`：先在 55 分钟后执行一次普通保活，再循环比较。
-- `next_awake` 缺失、格式错误、已过期或距离当前不足 30 秒：兜底为 `当前时间 + 55 分钟`。
-
-普通保活不会刷新 `lastUserSnapshotAt`。因此，如果用户最后一次说话后 55 分钟 AI 被唤醒，AI 留言后又设置 30 分钟后再醒，下一次提示会告诉 AI 距离用户最后一次对话已经约 85 分钟。
-
-## 推送
-
-支持 ntfy 和 UnifiedPush。
-
-ntfy：
-
-- 可使用 `NTFY_SERVER_URL`、`NTFY_TOPIC`、`NTFY_ACCESS_TOKEN` 作为服务端兜底配置。
-- App 也会在快照/推送配置中上报每个会话的 ntfy 配置，优先使用 App 上报值。
-- 这是直接推送到 ntfy App 的回退通道。
-
-UnifiedPush：
-
-- App 注册后会上报 `{ endpoint, p256dh, auth }`。
-- 服务端按 RFC 8291 WebPush `aes128gcm` 加密 `{ conversationId, message }` 后 POST 到 endpoint。
-- ntfy 等 UnifiedPush 分发器只负责后台分发，明文只在手机端由 YSClaude 解出并弹出原生通知。
-- `YSCLAUDE_APP_DEEPLINK_BASE` 可改为自定义格式，支持 `{conversationId}` 占位，例如：
-
-```text
-YSCLAUDE_APP_DEEPLINK_BASE=ysclaude://chat/{conversationId}
+```json
+{"action":"agent_activity","summary":"整理了用户今天提到的计划，暂时不推送。","messagesToAppend":[{"role":"assistant","content":"[远程自主活动记录] 整理了今天的复盘提醒。"}],"next_awake":"2026-07-04T14:30:00.000Z"}
 ```
 
-推送失败不会中断保活或 AI 定时任务。
+`noop` 的 `reason` 也会写入 activity，并在 App 同步后写回本地聊天记录。
+
+## 同步机制
+
+AI 给用户留言时：
+
+1. 服务端写入 `pendingMessages`。
+2. 服务端发送钉钉或 WxPusher 推送。
+3. 用户打开 App 后，App 拉取 `/v1/keepalive/inbox`。
+4. App 写入本地数据库。
+5. App 调用 `/v1/keepalive/inbox/ack` 确认消费。
+
+AI 自主活动或 `noop` 判断时：
+
+1. 服务端写入 `activityLog`。
+2. App 拉取 `/v1/keepalive/activity`。
+3. 如果 activity 带有 `appendedMessages`，App 写入本地聊天记录。
+4. App 调用 `/v1/keepalive/activity/ack` 确认消费。
+
+推送失败不会中断保活或 AI 定时任务。真实消息以服务端收件箱和活动记录为准。
 
 ## 勿扰时间
 
 App 上传快照时会带勿扰时间配置。
 
-当前服务端语义是：每天到勿扰开始时间后，清空一切服务端数据，包括：
+当前服务端语义是：每天进入勿扰开始时间后，清空一切服务端数据，包括：
 
 - 所有对话快照。
 - 所有保活 timer。
 - 所有 AI 定时唤醒 timer。
-- 待消费消息和活动日志。
+- 待消费消息和活动记录。
 - `data/state.json` 中的持久化数据。
 
 如果某次快照计算出的下一次触发时间已经落入勿扰时间，服务端也会直接清空并返回：
@@ -154,37 +208,6 @@ App 上传快照时会带勿扰时间配置。
 ```json
 {"ok":true,"status":"cleared","reason":"quiet-hours"}
 ```
-
-## 普通保活兼容
-
-有些模型或网关要求对话必须以 `user` 消息结尾。如果 AI 主动留言后用户没有回复，快照最后一条会是 `assistant`，普通保活可能报错：
-
-```text
-This model does not support assistant message prefill.
-```
-
-服务端会在普通保活请求中临时追加一条 user ping：
-
-```text
-[Server keepalive ping] Keep the prompt cache warm. Do not answer this message.
-```
-
-这条消息只用于本次保活请求，不会写入服务端快照，也不会同步到 App 对话。
-
-## WxPusher 回退推送
-
-- 可使用 `WXPUSHER_APP_TOKEN`、`WXPUSHER_UIDS`、`WXPUSHER_TOPIC_IDS` 作为服务端兜底配置。
-- App 也可以上报每个会话自己的 WxPusher AppToken、UID 或 Topic ID。
-- 适合一加等严格杀后台机型作为稳定兜底；通知来自 WxPusher/微信，点击可通过 deep link 回到 YSClaude。
-
-## 当前推送通道
-
-当前版本只保留两个远程推送通道，二选一：
-
-- `dingtalk`：钉钉群自定义机器人 Webhook。可配置 `DINGTALK_WEBHOOK`、`DINGTALK_SECRET`、`DINGTALK_AT_MOBILES` 作为服务端兜底，也可由 App 上报每个会话自己的配置。
-- `wxpusher`：WxPusher AppToken + UID/Topic ID。可配置 `WXPUSHER_APP_TOKEN`、`WXPUSHER_UIDS`、`WXPUSHER_TOPIC_IDS` 作为服务端兜底，也可由 App 上报。
-
-服务端会忽略旧的 `ntfy`、`unifiedpush`、`all/both` 推送配置；App 设置页也不再显示这些通道。
 
 ## 接口
 
@@ -197,7 +220,7 @@ This model does not support assistant message prefill.
 - `POST /v1/keepalive/activity/ack`：标记自主活动记录已消费。
 - `POST /v1/keepalive/snapshot`：上传并覆盖当前对话快照。
 - `POST /v1/keepalive/disable`：取消当前对话保活。
-- `POST /v1/keepalive/delete`：删除指定对话快照，JSON body: `{ "conversationId": "..." }`。
+- `POST /v1/keepalive/delete`：删除指定对话快照。
 - `DELETE /v1/keepalive/conversations/:conversationId`：删除指定对话快照。
 - `POST /v1/keepalive/push-token`：上报或更新推送配置。
 - `POST /v1/keepalive/push-test`：发送测试推送。
@@ -208,24 +231,8 @@ This model does not support assistant message prefill.
 Authorization: Bearer <token>
 ```
 
-查看日志示例：
-
-```powershell
-curl.exe -H "Authorization: Bearer <token>" "https://你的-zeabur-域名/v1/keepalive/logs?limit=50"
-```
-
-删除快照示例：
-
-```powershell
-curl.exe -X POST `
-  -H "Authorization: Bearer <token>" `
-  -H "Content-Type: application/json" `
-  -d "{\"conversationId\":\"要删除的 conversationId\"}" `
-  "https://你的-zeabur-域名/v1/keepalive/delete"
-```
-
 ## 数据与隐私
 
-服务会把请求快照保存到 `data/state.json`，其中包含对话快照和 API Key。只建议部署在你完全控制的机器上，不要暴露到公网，或至少放在 HTTPS / 内网 / 反代鉴权之后。
+服务端会把请求快照保存到 `data/state.json`，其中包含对话快照和 API Key。只建议部署在你完全控制的机器或可信平台上，并放在 HTTPS、内网或反代鉴权之后。
 
-进入勿扰时间后，服务端会清空 `state.conversations` 和 `state.logs` 并写回 `data/state.json`。
+进入勿扰时间后，服务端会清空 `state.conversations` 和 `state.logs`，并写回 `data/state.json`。
