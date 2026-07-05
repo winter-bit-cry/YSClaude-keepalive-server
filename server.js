@@ -14,6 +14,7 @@ const KEEPALIVE_INTERVAL_MS = Number(process.env.KEEPALIVE_INTERVAL_MS || 55 * 6
 const MAX_BODY_BYTES = 12 * 1024 * 1024;
 const MAX_LOG_ENTRIES = Number(process.env.MAX_LOG_ENTRIES || 300);
 const SNAPSHOT_PREVIEW_TAIL_CHARS = 120;
+const RECENT_SNAPSHOT_LIMIT = 5;
 const AGENT_TICK_MAX_TOKENS = Number(process.env.AGENT_TICK_MAX_TOKENS || 800);
 const AGENT_ACTIVITY_MAX_TOOL_ROUNDS = Number(process.env.AGENT_ACTIVITY_MAX_TOOL_ROUNDS || 4);
 const WXPUSHER_APP_TOKEN = process.env.WXPUSHER_APP_TOKEN || '';
@@ -66,6 +67,19 @@ function normalizeFutureTimestamp(value, baseTime = now()) {
     return Number.isFinite(parsed) && parsed > baseTime + 30 * 1000 ? parsed : null;
   }
   return null;
+}
+
+function normalizeClientTimestamp(value, fallback = now()) {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return value > 1000000000 && value < 100000000000 ? value * 1000 : value;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) return normalizeClientTimestamp(numeric, fallback);
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
 }
 
 function extractDecisionNextAwakeAt(decision, baseTime = now()) {
@@ -372,6 +386,22 @@ function buildSnapshotPreview(request) {
     lastMessageRole: lastTextMessage?.role || fallbackMessage?.role || null,
     lastMessageTail: lastMessageText || (fallbackMessage?.tool_calls?.length ? '[工具调用]' : null),
   };
+}
+
+function buildRecentSnapshotEntry({ snapshotHash: hash, request, preview, clientUpdatedAt, receivedAt }) {
+  return {
+    snapshotHash: hash,
+    clientUpdatedAt,
+    receivedAt,
+    preview,
+    messageCount: Array.isArray(request?.messages) ? request.messages.length : 0,
+  };
+}
+
+function appendRecentSnapshot(existing, entry) {
+  const recent = Array.isArray(existing?.recentSnapshots) ? existing.recentSnapshots : [];
+  const deduped = recent.filter((item) => item?.snapshotHash !== entry.snapshotHash);
+  return [...deduped, entry].slice(-RECENT_SNAPSHOT_LIMIT);
 }
 
 function minutesOfDay(timestamp) {
@@ -1331,6 +1361,7 @@ function validateSnapshot(input) {
   return {
     conversationId: input.conversationId.trim(),
     request,
+    clientUpdatedAt: normalizeClientTimestamp(input.updatedAt, now()),
     quietHours: input.quietHours || { enabled: false },
     agentTools: normalizeAgentTools(input.agentTools),
     agentTick: normalizeAgentTick(input.agentTick),
@@ -1421,6 +1452,34 @@ async function handleSnapshot(req, res) {
   const hash = snapshotHash(request);
   const preview = buildSnapshotPreview(request);
   const existing = state.conversations[input.conversationId] || {};
+  const clientUpdatedAt = input.clientUpdatedAt || touchedAt;
+  if (
+    existing.status === 'active' &&
+    isFiniteTimestamp(existing.clientUpdatedAt) &&
+    clientUpdatedAt < existing.clientUpdatedAt
+  ) {
+    addLog('snapshot-ignored-stale', {
+      conversationId: input.conversationId,
+      snapshotHash: hash,
+      existingSnapshotHash: existing.snapshotHash,
+      clientUpdatedAt,
+      existingClientUpdatedAt: existing.clientUpdatedAt,
+      preview,
+      message: `stale ${new Date(clientUpdatedAt).toISOString()}`,
+    });
+    jsonResponse(res, 200, {
+      ok: true,
+      status: 'ignored-stale',
+      snapshotHash: existing.snapshotHash || null,
+      ignoredSnapshotHash: hash,
+      clientUpdatedAt,
+      activeClientUpdatedAt: existing.clientUpdatedAt,
+      nextKeepaliveAt: existing.nextKeepaliveAt || null,
+      nextAwakeAt: existing.nextAwakeAt || null,
+      nextTriggerKind: existing.nextTriggerKind || null,
+    });
+    return;
+  }
   const initialSchedule = computeNextSchedule(
     { agentTools: input.agentTools, agentTick: input.agentTick },
     touchedAt
@@ -1450,14 +1509,23 @@ async function handleSnapshot(req, res) {
     nextAwakeAt: initialSchedule.nextAwakeAt,
     nextTriggerKind: initialSchedule.triggerKind,
     updatedAt: touchedAt,
+    clientUpdatedAt,
     lastError: null,
     pendingMessages: existing.pendingMessages || [],
     activityLog: existing.activityLog || [],
+    recentSnapshots: appendRecentSnapshot(existing, buildRecentSnapshotEntry({
+      snapshotHash: hash,
+      request,
+      preview,
+      clientUpdatedAt,
+      receivedAt: touchedAt,
+    })),
   };
   addLog('snapshot-updated', {
     conversationId: input.conversationId,
     snapshotHash: hash,
     lastUserSnapshotAt: touchedAt,
+    clientUpdatedAt,
     nextKeepaliveAt,
     nextAwakeAt: initialSchedule.nextAwakeAt,
     nextTriggerKind: initialSchedule.triggerKind,
@@ -1471,6 +1539,7 @@ async function handleSnapshot(req, res) {
     status: 'active',
     snapshotHash: hash,
     lastUserSnapshotAt: touchedAt,
+    clientUpdatedAt,
     nextKeepaliveAt,
     nextAwakeAt: initialSchedule.nextAwakeAt,
     nextTriggerKind: initialSchedule.triggerKind,
@@ -1557,12 +1626,14 @@ function publicStatus() {
     nextTriggerKind: item.nextTriggerKind || null,
     lastError: item.lastError,
     updatedAt: item.updatedAt,
+    clientUpdatedAt: item.clientUpdatedAt || null,
     preview: item.preview,
     agentToolsEnabled: getAgentToolDefinitions(item.agentTools).map((tool) => tool.function.name),
     agentTickEnabled: item.agentTick ? item.agentTick.enabled === true : getAgentToolDefinitions(item.agentTools).length > 0,
     pushConfigured: Boolean(getWxPusherConfig(item) || getDingTalkConfig(item)),
     pendingMessageCount: (item.pendingMessages || []).filter((message) => !message.consumed).length,
     activityCount: (item.activityLog || []).filter((entry) => !entry.consumed).length,
+    recentSnapshotCount: Array.isArray(item.recentSnapshots) ? item.recentSnapshots.length : 0,
   }));
 }
 
