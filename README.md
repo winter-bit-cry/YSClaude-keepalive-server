@@ -4,6 +4,8 @@ YSClaude Keepalive Server 是给 YSClaude App 使用的远程 Prompt Cache 保�
 
 App 会把最近一次可恢复的对话请求快照上传到服务端。用户离开 App 后，服务端继续按计划维持缓存，并在合适的时间唤醒 AI，让 AI 决定是否给用户留言、记录一次自主活动，或者暂时不打扰。用户下次打开 App 或点击推送进入对话时，本地会同步服务端的离线收件箱和活动记录。
 
+具体原理、部署流程和设计取舍见 [TUTORIAL.md](./TUTORIAL.md)。
+
 当前推送方式只保留两种，二选一：
 
 - 钉钉自定义机器人
@@ -236,3 +238,7 @@ Authorization: Bearer <token>
 服务端会把请求快照保存到 `data/state.json`，其中包含对话快照和 API Key。只建议部署在你完全控制的机器或可信平台上，并放在 HTTPS、内网或反代鉴权之后。
 
 进入勿扰时间后，服务端会清空 `state.conversations` 和 `state.logs`，并写回 `data/state.json`。
+
+## 开源协议
+
+本项目采用 GPL-3.0 开源协议。
