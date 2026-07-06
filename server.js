@@ -1574,6 +1574,61 @@ async function handleDisable(req, res) {
   jsonResponse(res, 200, { ok: true, status: 'disabled' });
 }
 
+async function handleEnable(req, res) {
+  const input = await readJsonBody(req);
+  const conversationId = String(input.conversationId || '').trim();
+  if (!conversationId) {
+    jsonResponse(res, 400, { ok: false, error: 'conversationId is required' });
+    return;
+  }
+
+  const existing = state.conversations[conversationId];
+  if (!existing?.request) {
+    jsonResponse(res, 404, { ok: false, error: 'snapshot not found' });
+    return;
+  }
+
+  const enabledAt = now();
+  const nextSchedule = computeNextSchedule(existing, enabledAt);
+  if (isInQuietHours(nextSchedule.nextKeepaliveAt, existing.quietHours)) {
+    await purgeAllStateForQuietHours('enable-next-trigger-in-quiet-hours');
+    jsonResponse(res, 200, { ok: true, status: 'cleared', reason: 'quiet-hours' });
+    return;
+  }
+
+  clearConversationTimer(conversationId);
+  state.conversations[conversationId] = {
+    ...existing,
+    status: 'active',
+    disabledReason: null,
+    nextKeepaliveAt: nextSchedule.nextKeepaliveAt,
+    nextAwakeAt: nextSchedule.nextAwakeAt,
+    nextTriggerKind: nextSchedule.triggerKind,
+    updatedAt: enabledAt,
+    lastError: null,
+  };
+
+  addLog('keepalive-enabled', {
+    conversationId,
+    snapshotHash: existing.snapshotHash,
+    nextKeepaliveAt: nextSchedule.nextKeepaliveAt,
+    nextAwakeAt: nextSchedule.nextAwakeAt,
+    nextTriggerKind: nextSchedule.triggerKind,
+    preview: existing.preview,
+    message: `${nextSchedule.triggerKind} ${new Date(nextSchedule.nextKeepaliveAt).toISOString()}`,
+  });
+  scheduleConversation(conversationId);
+  await saveState();
+  jsonResponse(res, 200, {
+    ok: true,
+    status: 'active',
+    snapshotHash: existing.snapshotHash || null,
+    nextKeepaliveAt: nextSchedule.nextKeepaliveAt,
+    nextAwakeAt: nextSchedule.nextAwakeAt,
+    nextTriggerKind: nextSchedule.triggerKind,
+  });
+}
+
 async function deleteConversation(conversationId) {
   const id = String(conversationId || '').trim();
   if (!id) {
@@ -2243,6 +2298,10 @@ async function route(req, res) {
     }
     if (req.method === 'POST' && url.pathname === '/v1/keepalive/snapshot') {
       await handleSnapshot(req, res);
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/v1/keepalive/enable') {
+      await handleEnable(req, res);
       return;
     }
     if (req.method === 'POST' && url.pathname === '/v1/keepalive/disable') {
