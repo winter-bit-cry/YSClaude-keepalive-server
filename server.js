@@ -196,6 +196,9 @@ async function loadState() {
     if (parsed && typeof parsed === 'object' && parsed.conversations) {
       state.conversations = parsed.conversations;
       state.logs = Array.isArray(parsed.logs) ? parsed.logs.slice(-MAX_LOG_ENTRIES) : [];
+      if (enforceSingleConversationState({ reason: 'state-load' }) > 0) {
+        await saveState();
+      }
     }
   } catch (error) {
     if (error.code !== 'ENOENT') {
@@ -488,6 +491,48 @@ function clearConversationTimer(conversationId) {
     clearTimeout(timer);
     timers.delete(conversationId);
   }
+}
+
+function pickSingleConversationId() {
+  const entries = Object.entries(state.conversations || {});
+  if (entries.length === 0) return null;
+  entries.sort(([, a], [, b]) => {
+    const aActive = a?.status === 'active' ? 1 : 0;
+    const bActive = b?.status === 'active' ? 1 : 0;
+    if (aActive !== bActive) return bActive - aActive;
+
+    const aTime = a?.clientUpdatedAt || a?.updatedAt || a?.lastUserSnapshotAt || a?.lastTouchedAt || 0;
+    const bTime = b?.clientUpdatedAt || b?.updatedAt || b?.lastUserSnapshotAt || b?.lastTouchedAt || 0;
+    return bTime - aTime;
+  });
+  return entries[0][0];
+}
+
+function enforceSingleConversationState({ keepConversationId, reason = 'single-snapshot' } = {}) {
+  const entries = Object.entries(state.conversations || {});
+  if (entries.length <= 1) return 0;
+
+  const keepId = keepConversationId && state.conversations[keepConversationId]
+    ? keepConversationId
+    : pickSingleConversationId();
+  if (!keepId) return 0;
+
+  let removed = 0;
+  for (const [conversationId, item] of entries) {
+    if (conversationId === keepId) continue;
+    clearConversationTimer(conversationId);
+    delete state.conversations[conversationId];
+    removed += 1;
+    addLog('snapshot-pruned', {
+      conversationId,
+      reason,
+      replacementConversationId: keepId,
+      snapshotHash: item?.snapshotHash,
+      preview: item?.preview,
+      message: `${reason}: replaced by ${keepId}`,
+    });
+  }
+  return removed;
 }
 
 function scheduleConversation(conversationId) {
@@ -1521,9 +1566,14 @@ async function handleSnapshot(req, res) {
       receivedAt: touchedAt,
     })),
   };
+  const prunedConversationCount = enforceSingleConversationState({
+    keepConversationId: input.conversationId,
+    reason: 'snapshot-replaced',
+  });
   addLog('snapshot-updated', {
     conversationId: input.conversationId,
     snapshotHash: hash,
+    prunedConversationCount,
     lastUserSnapshotAt: touchedAt,
     clientUpdatedAt,
     nextKeepaliveAt,
@@ -1554,7 +1604,11 @@ async function handleDisable(req, res) {
     return;
   }
   clearConversationTimer(conversationId);
-  const existing = state.conversations[conversationId] || { conversationId };
+  const existing = state.conversations[conversationId];
+  if (!existing) {
+    jsonResponse(res, 200, { ok: true, status: 'not-found' });
+    return;
+  }
   state.conversations[conversationId] = {
     ...existing,
     status: 'disabled',
@@ -1607,10 +1661,15 @@ async function handleEnable(req, res) {
     updatedAt: enabledAt,
     lastError: null,
   };
+  const prunedConversationCount = enforceSingleConversationState({
+    keepConversationId: conversationId,
+    reason: 'enable-replaced',
+  });
 
   addLog('keepalive-enabled', {
     conversationId,
     snapshotHash: existing.snapshotHash,
+    prunedConversationCount,
     nextKeepaliveAt: nextSchedule.nextKeepaliveAt,
     nextAwakeAt: nextSchedule.nextAwakeAt,
     nextTriggerKind: nextSchedule.triggerKind,
